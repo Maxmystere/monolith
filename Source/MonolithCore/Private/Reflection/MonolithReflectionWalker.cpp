@@ -5,6 +5,7 @@
 #include "StructUtils/InstancedStruct.h"
 #include "UObject/TextProperty.h"
 #include "MonolithJsonUtils.h"
+#include "JsonObjectConverter.h"
 #include "UObject/UnrealType.h"
 #include "UObject/EnumProperty.h"
 #include "UObject/PropertyPortFlags.h"
@@ -1362,12 +1363,32 @@ void FMonolithReflectionWalker::WriteSoftObjectRef(FSoftObjectProperty* SoftProp
 // ---------------------------------------------------------------------------
 void FMonolithReflectionWalker::WriteObjectRef(FObjectProperty* ObjProp, void* ValuePtr, const TSharedPtr<FJsonValue>& JsonVal, UObject* /*Container*/, FBulkFillFieldWrite& OutWrite)
 {
-	const FString PathStr = JsonVal->AsString();
-	OutWrite.ProposedValue = PathStr;
-
 	// Snapshot current pointed-at object's path (or empty if null).
 	UObject* OldRef = ObjProp->GetObjectPropertyValue(ValuePtr);
 	OutWrite.CurrentValue = OldRef ? OldRef->GetPathName() : FString();
+
+	// Inline subobject ({"_ClassName": "...", <fields>}): built by the engine converter, which
+	// outers it to the transient package; the caller's cradle reparents it.
+	if (JsonVal->Type == EJson::Object)
+	{
+		OutWrite.ProposedValue = TEXT("{inline object}");
+		if (ObjProp->IsA(FClassProperty::StaticClass()))
+		{
+			OutWrite.bOk = false;
+			OutWrite.Reason = TEXT("class reference expects a class path string, got a JSON object");
+			return;
+		}
+		FText FailReason;
+		OutWrite.bOk = FJsonObjectConverter::JsonValueToUProperty(JsonVal, ObjProp, ValuePtr, 0, 0, false, &FailReason);
+		if (!OutWrite.bOk)
+		{
+			OutWrite.Reason = FailReason.ToString();
+		}
+		return;
+	}
+
+	const FString PathStr = JsonVal->AsString();
+	OutWrite.ProposedValue = PathStr;
 
 	// "None" is what the reflection reader emits for a null reference.
 	if (PathStr.IsEmpty() || PathStr == TEXT("None"))
