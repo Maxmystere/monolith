@@ -208,6 +208,41 @@ CREATE TRIGGER IF NOT EXISTS fts_nodes_au AFTER UPDATE ON nodes BEGIN
     VALUES (new.id, new.node_name, new.node_class, new.node_type);
 END;
 
+-- Literal defaults typed into unlinked input pins (schema v4). One row per pin, so a
+-- search hit names the node and pin. Rows go away with their node.
+-- (No semicolons in these comments: CreateTables splits this script on them.)
+CREATE TABLE IF NOT EXISTS pin_defaults (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    graph_name TEXT DEFAULT '',
+    pin_name TEXT NOT NULL,
+    value TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pin_defaults_node ON pin_defaults(node_id);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_pin_defaults USING fts5(
+    value,
+    pin_name,
+    content=pin_defaults,
+    content_rowid=id,
+    tokenize='porter unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS fts_pin_defaults_ai AFTER INSERT ON pin_defaults BEGIN
+    INSERT INTO fts_pin_defaults(rowid, value, pin_name)
+    VALUES (new.id, new.value, new.pin_name);
+END;
+CREATE TRIGGER IF NOT EXISTS fts_pin_defaults_ad AFTER DELETE ON pin_defaults BEGIN
+    INSERT INTO fts_pin_defaults(fts_pin_defaults, rowid, value, pin_name)
+    VALUES ('delete', old.id, old.value, old.pin_name);
+END;
+CREATE TRIGGER IF NOT EXISTS fts_pin_defaults_au AFTER UPDATE ON pin_defaults BEGIN
+    INSERT INTO fts_pin_defaults(fts_pin_defaults, rowid, value, pin_name)
+    VALUES ('delete', old.id, old.value, old.pin_name);
+    INSERT INTO fts_pin_defaults(rowid, value, pin_name)
+    VALUES (new.id, new.value, new.pin_name);
+END;
+
 -- Metadata table for tracking index state
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -354,6 +389,43 @@ bool FMonolithIndexDatabase::Open(const FString& InDbPath)
 		}
 	}
 
+	// Schema migration: v3 -> v4 (pin defaults). The tables come from CreateTables above
+	// (IF NOT EXISTS), so this only has to make existing Blueprints get them: clearing
+	// their stored hashes makes the next incremental index treat them as modified and
+	// re-index them, without a full rebuild. Skipped when v3 did not land.
+	{
+		const int32 Version = FCString::Atoi(*ReadMeta(TEXT("schema_version")));
+		if (Version == 3)
+		{
+			const bool bMigrated = ExecuteSQL(TEXT(
+				"UPDATE assets SET saved_hash = '', deep_indexed_hash = '' "
+				"WHERE asset_class IN ('Blueprint', 'WidgetBlueprint', 'AnimBlueprint');"));
+			if (bMigrated)
+			{
+				WriteMeta(TEXT("schema_version"), FString::FromInt(CurrentSchemaVersion));
+			}
+			else
+			{
+				UE_LOG(LogMonolithIndex, Error,
+					TEXT("Index schema migration to v4 failed — Blueprint pin defaults stay unindexed until a full reindex"));
+			}
+		}
+	}
+
+	// Searchable only when the tables are really there (a DB created by a newer
+	// build, or a CreateTables failure, must not break project search).
+	{
+		bHasPinDefaults = false;
+		FSQLitePreparedStatement TableStmt;
+		if (TableStmt.Create(*Database, TEXT("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('pin_defaults', 'fts_pin_defaults');"))
+			&& TableStmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			int64 Found = 0;
+			TableStmt.GetColumnValueByIndex(0, Found);
+			bHasPinDefaults = Found == 2;
+		}
+	}
+
 	// Ensure hash index exists (safe for both fresh and migrated DBs)
 	ExecuteSQL(TEXT("CREATE INDEX IF NOT EXISTS idx_assets_hash ON assets(saved_hash);"));
 
@@ -387,6 +459,11 @@ bool FMonolithIndexDatabase::ResetDatabase()
 	ExecuteSQL(TEXT("DROP TRIGGER IF EXISTS fts_nodes_ai;"));
 	ExecuteSQL(TEXT("DROP TRIGGER IF EXISTS fts_nodes_ad;"));
 	ExecuteSQL(TEXT("DROP TRIGGER IF EXISTS fts_nodes_au;"));
+	ExecuteSQL(TEXT("DROP TRIGGER IF EXISTS fts_pin_defaults_ai;"));
+	ExecuteSQL(TEXT("DROP TRIGGER IF EXISTS fts_pin_defaults_ad;"));
+	ExecuteSQL(TEXT("DROP TRIGGER IF EXISTS fts_pin_defaults_au;"));
+	ExecuteSQL(TEXT("DROP TABLE IF EXISTS fts_pin_defaults;"));
+	ExecuteSQL(TEXT("DROP TABLE IF EXISTS pin_defaults;"));
 	ExecuteSQL(TEXT("DROP TABLE IF EXISTS fts_assets;"));
 	ExecuteSQL(TEXT("DROP TABLE IF EXISTS fts_nodes;"));
 	ExecuteSQL(TEXT("DROP TABLE IF EXISTS tag_references;"));
@@ -413,7 +490,8 @@ bool FMonolithIndexDatabase::ResetDatabase()
 	// schema version" until the next Open(), and every version-gated path
 	// (incremental indexing, resume) silently degrades for the rest of the session.
 	ExecuteSQL(TEXT("CREATE INDEX IF NOT EXISTS idx_assets_hash ON assets(saved_hash);"));
-	return WriteMeta(TEXT("schema_version"), TEXT("3"));
+	bHasPinDefaults = true;
+	return WriteMeta(TEXT("schema_version"), FString::FromInt(CurrentSchemaVersion));
 }
 
 // ============================================================
@@ -528,6 +606,24 @@ int64 FMonolithIndexDatabase::InsertNode(const FIndexedNode& Node)
 	Stmt.SetBindingValueByIndex(5, Node.Properties);
 	Stmt.SetBindingValueByIndex(6, static_cast<int64>(Node.PosX));
 	Stmt.SetBindingValueByIndex(7, static_cast<int64>(Node.PosY));
+
+	if (!Stmt.Execute()) return -1;
+	return Database->GetLastInsertRowId();
+}
+
+int64 FMonolithIndexDatabase::InsertPinDefault(const FIndexedPinDefault& PinDefault)
+{
+	if (!IsOpen() || !bHasPinDefaults) return -1;
+
+	FSQLitePreparedStatement Stmt;
+	if (!Stmt.Create(*Database, TEXT("INSERT INTO pin_defaults (node_id, graph_name, pin_name, value) VALUES (?, ?, ?, ?);")))
+	{
+		return -1;
+	}
+	Stmt.SetBindingValueByIndex(1, PinDefault.NodeId);
+	Stmt.SetBindingValueByIndex(2, PinDefault.GraphName);
+	Stmt.SetBindingValueByIndex(3, PinDefault.PinName);
+	Stmt.SetBindingValueByIndex(4, PinDefault.Value);
 
 	if (!Stmt.Execute()) return -1;
 	return Database->GetLastInsertRowId();
@@ -1410,7 +1506,8 @@ EMonolithProjectSearchStatus FMonolithIndexDatabase::FullTextSearch(
 	auto RunSearch = [this, &OutResults, &Query, ClampedLimit, &AssetClassFilter](
 		const TCHAR* SQL,
 		const TCHAR* TableName,
-		FString& AttemptError) -> EAttempt
+		FString& AttemptError,
+		bool bPinColumns = false) -> EAttempt
 	{
 		AttemptError.Reset();
 
@@ -1489,6 +1586,12 @@ EMonolithProjectSearchStatus FMonolithIndexDatabase::FullTextSearch(
 			double RankD = 0.0;
 			Stmt.GetColumnValueByIndex(5, RankD);
 			R.Rank = static_cast<float>(RankD);
+			if (bPinColumns)
+			{
+				Stmt.GetColumnValueByIndex(6, R.GraphName);
+				Stmt.GetColumnValueByIndex(7, R.NodeName);
+				Stmt.GetColumnValueByIndex(8, R.PinName);
+			}
 			TableResults.Add(MoveTemp(R));
 		}
 
@@ -1533,9 +1636,28 @@ EMonolithProjectSearchStatus FMonolithIndexDatabase::FullTextSearch(
 		return ToStatus(NodeAttempt);
 	}
 
+	// And the literal defaults typed into Blueprint pins (schema v4). Each hit names the
+	// graph, node and pin. A DB without the tables just skips this pass.
+	EAttempt PinAttempt = EAttempt::NotApplicable;
+	if (bHasPinDefaults)
+	{
+		const FString PinSQL = FString::Printf(
+			TEXT("SELECT a.package_path, a.asset_name, a.asset_class, a.module_name, snippet(fts_pin_defaults, 0, '>>>', '<<<', '...', 32) as ctx, f.rank, p.graph_name, n.node_name, p.pin_name FROM fts_pin_defaults f JOIN pin_defaults p ON p.id = f.rowid JOIN nodes n ON n.id = p.node_id JOIN assets a ON a.id = n.asset_id WHERE fts_pin_defaults MATCH ?%s ORDER BY f.rank LIMIT ?;"),
+			*ClassPredicate);
+
+		FString PinError;
+		PinAttempt = RunSearch(*PinSQL, TEXT("pin defaults"), PinError, /*bPinColumns=*/true);
+		if (PinAttempt == EAttempt::InvalidQuery || PinAttempt == EAttempt::InternalError)
+		{
+			OutResults.Reset();
+			OutError = PinError;
+			return ToStatus(PinAttempt);
+		}
+	}
+
 	// No FTS table exposes the requested column, so the caller named one that
 	// does not exist anywhere in the index.
-	if (AssetAttempt == EAttempt::NotApplicable && NodeAttempt == EAttempt::NotApplicable)
+	if (AssetAttempt == EAttempt::NotApplicable && NodeAttempt == EAttempt::NotApplicable && PinAttempt == EAttempt::NotApplicable)
 	{
 		OutResults.Reset();
 		OutError = MonolithProjectSearchDetail::DescribeUnknownColumn(AssetError);
