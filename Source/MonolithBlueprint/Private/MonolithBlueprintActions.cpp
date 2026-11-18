@@ -3,6 +3,7 @@
 #include "Animation/AnimInstance.h"
 #include "Engine/Blueprint.h"
 #include "MonolithBlueprintInternal.h"
+#include "MonolithBlueprintGraphRenderer.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithParamSchema.h"
 #include "Serialization/JsonWriter.h"
@@ -38,12 +39,35 @@ void FMonolithBlueprintActions::RegisterActions()
 			.Build());
 
 	Registry.RegisterAction(TEXT("blueprint"), TEXT("get_graph_data"),
-		TEXT("Get full graph data with all nodes, pins, and connections. Optional node_class_filter to include only matching node classes."),
+		TEXT("Get full graph data with all nodes, pins, and connections. Optional node_class_filter to include only matching node classes. "
+			 "graph_names reads several graphs in one call ([] = all), returned under 'graphs'; max_nodes/offset page the nodes "
+			 "(across graphs) and report truncated/next_offset; include_pin_types=false drops each pin's type. "
+			 "For a compact read of a whole Blueprint, render_graph is usually smaller."),
 		FMonolithActionHandler::CreateStatic(&HandleGetGraphData),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Blueprint asset path"))
-			.Optional(TEXT("graph_name"), TEXT("string"), TEXT("Graph name (defaults to first event graph)"))
+			.Optional(TEXT("graph_name"), TEXT("string"), TEXT("Graph name (defaults to first event graph). Ignored when graph_names is given."))
+			.Optional(TEXT("graph_names"), TEXT("array"), TEXT("Read several graphs in one call; [] = every graph (event graphs, functions, macros, delegate signatures, interface graphs, nested graphs). The response then lists them under 'graphs'."))
 			.Optional(TEXT("node_class_filter"), TEXT("string"), TEXT("Only include nodes whose class contains this substring"))
+			.Optional(TEXT("max_nodes"), TEXT("integer"), TEXT("Return at most this many nodes (across graphs). 0 = no limit (default). The response reports total_nodes, truncated and next_offset."), TEXT("0"))
+			.Optional(TEXT("offset"), TEXT("integer"), TEXT("Skip this many nodes first (the next_offset of a truncated response)."), TEXT("0"))
+			.Optional(TEXT("include_pin_types"), TEXT("bool"), TEXT("Include each pin's type string. Default true; false makes large dumps noticeably smaller."), TEXT("true"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("render_graph"),
+		TEXT("Render Blueprint graphs as compact pseudo-code: exec flow walked from each entry (function entry, then events by position), "
+			 "one statement per line, branches indented under their labels (true:/false:, Then 0:, Loop Body:), merge points labelled "
+			 "(L1: ... / goto L1), pure nodes inlined as nested expressions, used outputs of impure calls bound to handles (h1 = Call(...)), "
+			 "only linked or non-default arguments, comment boxes as '# [text]', node comments as '// text', [DISABLED] tags, @(x,y) positions, "
+			 "unreachable exec nodes listed, and data-only graphs (AnimGraph, transition rules) rendered as 'Sink <- (Pin=expr)'. "
+			 "Reads all graphs by default; usually a fraction of the size of get_graph_data."),
+		FMonolithActionHandler::CreateStatic(&HandleRenderGraph),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Blueprint asset path"))
+			.Optional(TEXT("graph_names"), TEXT("array"), TEXT("Graphs to render; omit or [] for every graph."))
+			.Optional(TEXT("include_positions"), TEXT("bool"), TEXT("Append @(x,y) node positions. Default true."), TEXT("true"))
+			.Optional(TEXT("max_nodes"), TEXT("integer"), TEXT("Stop adding whole graphs once this many nodes are rendered (the first graph is always rendered). 0 = no limit (default)."), TEXT("0"))
+			.Optional(TEXT("offset"), TEXT("integer"), TEXT("Index of the first graph to render (the next_offset of a truncated response)."), TEXT("0"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("blueprint"), TEXT("get_graph_summary"),
@@ -291,8 +315,88 @@ FMonolithActionResult FMonolithBlueprintActions::HandleListGraphs(const TSharedP
 
 // --- get_graph_data ---
 
+namespace MonolithGraphReadDetail
+{
+	/** graph_names -> graphs, or every graph for []. Missing names are reported, not skipped. */
+	static bool ResolveGraphNames(UBlueprint* BP, const TArray<TSharedPtr<FJsonValue>>& Names, TArray<UEdGraph*>& OutGraphs, FString& OutError)
+	{
+		if (Names.Num() == 0)
+		{
+			OutGraphs = FMonolithBlueprintGraphRenderer::CollectGraphs(BP);
+			return true;
+		}
+		TArray<FString> Missing;
+		for (const TSharedPtr<FJsonValue>& Value : Names)
+		{
+			FString Name;
+			if (!Value.IsValid() || !Value->TryGetString(Name) || Name.IsEmpty())
+			{
+				continue;
+			}
+			if (UEdGraph* Graph = MonolithBlueprintInternal::FindGraphByName(BP, Name))
+			{
+				OutGraphs.AddUnique(Graph);
+			}
+			else
+			{
+				Missing.Add(Name);
+			}
+		}
+		if (Missing.Num() > 0)
+		{
+			TArray<FString> Available;
+			for (UEdGraph* Graph : FMonolithBlueprintGraphRenderer::CollectGraphs(BP))
+			{
+				Available.Add(Graph->GetName());
+			}
+			OutError = FString::Printf(TEXT("Graph(s) not found: %s. Available: %s"),
+				*FString::Join(Missing, TEXT(", ")), *FString::Join(Available, TEXT(", ")));
+			return false;
+		}
+		return true;
+	}
+
+	static void DescribeGraphInto(UBlueprint* BP, UEdGraph* Graph, const TSharedPtr<FJsonObject>& Obj)
+	{
+		Obj->SetStringField(TEXT("graph_name"), Graph->GetName());
+		FString InterfaceName;
+		FString ParentGraph;
+		Obj->SetStringField(TEXT("graph_type"), MonolithBlueprintInternal::ClassifyGraphType(BP, Graph, InterfaceName, &ParentGraph));
+		if (!InterfaceName.IsEmpty())
+		{
+			Obj->SetStringField(TEXT("interface"), InterfaceName);
+		}
+		if (!ParentGraph.IsEmpty())
+		{
+			Obj->SetStringField(TEXT("parent_graph"), ParentGraph);
+		}
+	}
+
+	static TSharedPtr<FJsonObject> SerializeNodeForRead(UEdGraphNode* Node, bool bIncludePinTypes)
+	{
+		TSharedPtr<FJsonObject> NodeObj = MonolithBlueprintInternal::SerializeNode(Node);
+		if (!bIncludePinTypes)
+		{
+			const TArray<TSharedPtr<FJsonValue>>* Pins = nullptr;
+			if (NodeObj->TryGetArrayField(TEXT("pins"), Pins) && Pins)
+			{
+				for (const TSharedPtr<FJsonValue>& PinValue : *Pins)
+				{
+					if (const TSharedPtr<FJsonObject> PinObj = PinValue->AsObject())
+					{
+						PinObj->RemoveField(TEXT("type"));
+					}
+				}
+			}
+		}
+		return NodeObj;
+	}
+}
+
 FMonolithActionResult FMonolithBlueprintActions::HandleGetGraphData(const TSharedPtr<FJsonObject>& Params)
 {
+	using namespace MonolithGraphReadDetail;
+
 	FString AssetPath;
 	UBlueprint* BP = LoadBlueprint(Params, AssetPath);
 	if (!BP)
@@ -300,40 +404,179 @@ FMonolithActionResult FMonolithBlueprintActions::HandleGetGraphData(const TShare
 		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
 	}
 
-	FString GraphName = Params->GetStringField(TEXT("graph_name"));
-	FString ClassFilter = Params->GetStringField(TEXT("node_class_filter"));
-	UEdGraph* Graph = MonolithBlueprintInternal::FindGraphByName(BP, GraphName);
-	if (!Graph)
+	FString ClassFilter;
+	Params->TryGetStringField(TEXT("node_class_filter"), ClassFilter);
+	bool bIncludePinTypes = true;
+	Params->TryGetBoolField(TEXT("include_pin_types"), bIncludePinTypes);
+	int32 MaxNodes = 0;
+	int32 Offset = 0;
+	Params->TryGetNumberField(TEXT("max_nodes"), MaxNodes);
+	Params->TryGetNumberField(TEXT("offset"), Offset);
+	if (MaxNodes < 0 || Offset < 0)
 	{
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Graph not found: %s"), *GraphName));
+		return FMonolithActionResult::Error(TEXT("max_nodes and offset must be >= 0"), FMonolithJsonUtils::ErrInvalidParams);
+	}
+	const bool bPaging = Params->HasField(TEXT("max_nodes")) || Params->HasField(TEXT("offset"));
+
+	// Single graph (graph_name, the original shape) or several (graph_names).
+	const TArray<TSharedPtr<FJsonValue>>* GraphNamesArr = nullptr;
+	const bool bMulti = Params->TryGetArrayField(TEXT("graph_names"), GraphNamesArr) && GraphNamesArr;
+	TArray<UEdGraph*> Graphs;
+	if (bMulti)
+	{
+		FString Error;
+		if (!ResolveGraphNames(BP, *GraphNamesArr, Graphs, Error))
+		{
+			return FMonolithActionResult::Error(Error, FMonolithJsonUtils::ErrInvalidParams);
+		}
+	}
+	else
+	{
+		FString GraphName;
+		Params->TryGetStringField(TEXT("graph_name"), GraphName);
+		UEdGraph* Graph = MonolithBlueprintInternal::FindGraphByName(BP, GraphName);
+		if (!Graph)
+		{
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Graph not found: %s"), *GraphName));
+		}
+		Graphs.Add(Graph);
+	}
+
+	// Page over the filtered nodes of all selected graphs, in order.
+	int32 Seen = 0;
+	int32 Returned = 0;
+	bool bTruncated = false;
+	TArray<TSharedPtr<FJsonValue>> GraphsArr;
+	TArray<TSharedPtr<FJsonValue>> SingleNodes;
+	for (UEdGraph* Graph : Graphs)
+	{
+		TArray<TSharedPtr<FJsonValue>> NodesArr;
+		int32 GraphNodeCount = 0;
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (!Node) continue;
+			if (!ClassFilter.IsEmpty() && !Node->GetClass()->GetName().Contains(ClassFilter)) continue;
+			++GraphNodeCount;
+			const int32 Index = Seen++;
+			if (Index < Offset) continue;
+			if (MaxNodes > 0 && Returned >= MaxNodes)
+			{
+				bTruncated = true;
+				continue;
+			}
+			NodesArr.Add(MakeShared<FJsonValueObject>(SerializeNodeForRead(Node, bIncludePinTypes)));
+			++Returned;
+		}
+
+		if (bMulti)
+		{
+			TSharedPtr<FJsonObject> GraphObj = MakeShared<FJsonObject>();
+			DescribeGraphInto(BP, Graph, GraphObj);
+			GraphObj->SetNumberField(TEXT("node_count"), GraphNodeCount);
+			GraphObj->SetArrayField(TEXT("nodes"), NodesArr);
+			GraphsArr.Add(MakeShared<FJsonValueObject>(GraphObj));
+		}
+		else
+		{
+			SingleNodes = MoveTemp(NodesArr);
+		}
 	}
 
 	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
-	Root->SetStringField(TEXT("graph_name"), Graph->GetName());
-
-	FString InterfaceName;
-	FString ParentGraph;
-	const FString GraphType = MonolithBlueprintInternal::ClassifyGraphType(
-		BP, Graph, InterfaceName, &ParentGraph);
-	Root->SetStringField(TEXT("graph_type"), GraphType);
-	if (!InterfaceName.IsEmpty())
+	if (bMulti)
 	{
-		Root->SetStringField(TEXT("interface"), InterfaceName);
+		Root->SetArrayField(TEXT("graphs"), GraphsArr);
 	}
-	if (!ParentGraph.IsEmpty())
+	else
 	{
-		Root->SetStringField(TEXT("parent_graph"), ParentGraph);
+		DescribeGraphInto(BP, Graphs[0], Root);
+		Root->SetArrayField(TEXT("nodes"), SingleNodes);
+	}
+	if (bMulti || bPaging)
+	{
+		Root->SetNumberField(TEXT("total_nodes"), Seen);
+		Root->SetNumberField(TEXT("returned_nodes"), Returned);
+		Root->SetNumberField(TEXT("offset"), Offset);
+		Root->SetBoolField(TEXT("truncated"), bTruncated);
+		if (bTruncated)
+		{
+			Root->SetNumberField(TEXT("next_offset"), Offset + Returned);
+		}
+	}
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithBlueprintActions::HandleRenderGraph(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithGraphReadDetail;
+
+	FString AssetPath;
+	UBlueprint* BP = LoadBlueprint(Params, AssetPath);
+	if (!BP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
 	}
 
-	TArray<TSharedPtr<FJsonValue>> NodesArr;
-	for (UEdGraphNode* Node : Graph->Nodes)
+	FMonolithBlueprintGraphRenderer::FOptions Options;
+	Params->TryGetBoolField(TEXT("include_positions"), Options.bPositions);
+	int32 MaxNodes = 0;
+	int32 Offset = 0;
+	Params->TryGetNumberField(TEXT("max_nodes"), MaxNodes);
+	Params->TryGetNumberField(TEXT("offset"), Offset);
+	if (MaxNodes < 0 || Offset < 0)
 	{
-		if (!Node) continue;
-		if (!ClassFilter.IsEmpty() && !Node->GetClass()->GetName().Contains(ClassFilter)) continue;
-		NodesArr.Add(MakeShared<FJsonValueObject>(MonolithBlueprintInternal::SerializeNode(Node)));
+		return FMonolithActionResult::Error(TEXT("max_nodes and offset must be >= 0"), FMonolithJsonUtils::ErrInvalidParams);
 	}
-	Root->SetArrayField(TEXT("nodes"), NodesArr);
 
+	TArray<UEdGraph*> Graphs;
+	const TArray<TSharedPtr<FJsonValue>>* GraphNamesArr = nullptr;
+	const TArray<TSharedPtr<FJsonValue>> NoNames;
+	FString Error;
+	if (!ResolveGraphNames(BP, (Params->TryGetArrayField(TEXT("graph_names"), GraphNamesArr) && GraphNamesArr) ? *GraphNamesArr : NoNames, Graphs, Error))
+	{
+		return FMonolithActionResult::Error(Error, FMonolithJsonUtils::ErrInvalidParams);
+	}
+
+	// Whole graphs only: stop before the graph that would exceed max_nodes (always render one).
+	TArray<FString> Sections;
+	TArray<TSharedPtr<FJsonValue>> GraphsArr;
+	int32 RenderedNodes = 0;
+	int32 Index = Offset;
+	for (; Index < Graphs.Num(); ++Index)
+	{
+		UEdGraph* Graph = Graphs[Index];
+		if (MaxNodes > 0 && Sections.Num() > 0 && RenderedNodes + Graph->Nodes.Num() > MaxNodes)
+		{
+			break;
+		}
+		const FString Text = FMonolithBlueprintGraphRenderer::RenderGraph(BP, Graph, Options);
+		Sections.Add(Text);
+		RenderedNodes += Graph->Nodes.Num();
+
+		FString Type;
+		FMonolithBlueprintGraphRenderer::DescribeGraph(BP, Graph, Type);
+		TSharedPtr<FJsonObject> GraphObj = MakeShared<FJsonObject>();
+		GraphObj->SetStringField(TEXT("name"), Graph->GetName());
+		GraphObj->SetStringField(TEXT("type"), Type);
+		GraphObj->SetNumberField(TEXT("node_count"), Graph->Nodes.Num());
+		GraphsArr.Add(MakeShared<FJsonValueObject>(GraphObj));
+	}
+
+	const FString Text = FString::Join(Sections, TEXT("\n\n"));
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("text"), Text);
+	Root->SetArrayField(TEXT("graphs"), GraphsArr);
+	Root->SetNumberField(TEXT("total_graphs"), Graphs.Num());
+	Root->SetNumberField(TEXT("offset"), Offset);
+	Root->SetNumberField(TEXT("rendered_nodes"), RenderedNodes);
+	Root->SetNumberField(TEXT("chars"), Text.Len());
+	const bool bTruncated = Index < Graphs.Num();
+	Root->SetBoolField(TEXT("truncated"), bTruncated);
+	if (bTruncated)
+	{
+		Root->SetNumberField(TEXT("next_offset"), Index);
+	}
 	return FMonolithActionResult::Success(Root);
 }
 
