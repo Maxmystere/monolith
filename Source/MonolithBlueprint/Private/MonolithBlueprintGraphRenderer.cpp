@@ -26,7 +26,6 @@
 #include "K2Node_MacroInstance.h"
 #include "K2Node_MakeArray.h"
 #include "K2Node_MakeMap.h"
-#include "K2Node_MakeStruct.h"
 #include "K2Node_Self.h"
 #include "K2Node_Tunnel.h"
 #include "K2Node_VariableGet.h"
@@ -83,7 +82,8 @@ namespace MonolithGraphRenderDetail
 
 	static FString Quote(const FString& In)
 	{
-		return TEXT("\"") + In.Replace(TEXT("\\"), TEXT("\\\\")).Replace(TEXT("\""), TEXT("\\\"")) + TEXT("\"");
+		return TEXT("\"") + In.Replace(TEXT("\\"), TEXT("\\\\")).Replace(TEXT("\""), TEXT("\\\""))
+			.Replace(TEXT("\r"), TEXT("")).Replace(TEXT("\n"), TEXT("\\n")) + TEXT("\"");
 	}
 
 	static FString PinTypeText(const UEdGraphPin* Pin)
@@ -224,7 +224,10 @@ namespace MonolithGraphRenderDetail
 		{
 			return false;
 		}
-		return Pin->DefaultObject || !Pin->DefaultValue.IsEmpty() || !Pin->DefaultTextValue.IsEmpty();
+		// A cleared string/text is a value of its own; other types have nothing to print when empty.
+		const FName Category = Pin->PinType.PinCategory;
+		return Category == UEdGraphSchema_K2::PC_String || Category == UEdGraphSchema_K2::PC_Text
+			|| Pin->DefaultObject || !Pin->DefaultValue.IsEmpty() || !Pin->DefaultTextValue.IsEmpty();
 	}
 
 	static FString Literal(const UEdGraphPin* Pin)
@@ -404,12 +407,12 @@ namespace MonolithGraphRenderDetail
 			return FString();
 		}
 
-		FString Args(const UEdGraphNode* Node, int32 Depth, const TSet<FName>& Skip = TSet<FName>())
+		FString Args(const UEdGraphNode* Node, int32 Depth)
 		{
 			TArray<FString> Parts;
 			for (const UEdGraphPin* Pin : DataPins(Node, EGPD_Input))
 			{
-				if (Pin->PinName == UEdGraphSchema_K2::PN_Self || Skip.Contains(Pin->PinName) || !ShowsArgument(Pin))
+				if (Pin->PinName == UEdGraphSchema_K2::PN_Self || !ShowsArgument(Pin))
 				{
 					continue;
 				}
@@ -450,7 +453,8 @@ namespace MonolithGraphRenderDetail
 			const UEdGraphNode* Node = Pin->GetOwningNode();
 			if (IsEntry(Node))
 			{
-				return Pin->PinName.ToString(); // a parameter of the event / function / macro
+				// The event's own delegate pin stands for the event; the rest are its parameters.
+				return Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Delegate ? NodeName(Node) : Pin->PinName.ToString();
 			}
 			if (!IsInline(Node))
 			{
@@ -547,6 +551,16 @@ namespace MonolithGraphRenderDetail
 			return Result;
 		}
 
+		/** " [in: Pin]" for a node with several exec inputs (Gate.Open, Timeline.Reverse, ...). */
+		static FString EnteredTag(const UEdGraphNode* Node, const UEdGraphPin* EnteredBy)
+		{
+			if (EnteredBy && !IsTunnelBoundary(Node) && ExecPins(Node, EGPD_Input).Num() > 1)
+			{
+				return FString::Printf(TEXT(" [in: %s]"), *EnteredBy->GetDisplayName().ToString());
+			}
+			return FString();
+		}
+
 		FString Statement(const UEdGraphNode* Node, const UEdGraphPin* EnteredBy)
 		{
 			FString Text;
@@ -577,11 +591,7 @@ namespace MonolithGraphRenderDetail
 				Text = FString::Printf(TEXT("%s%s(%s)"), *TargetPrefix(Node, 0), *NodeName(Node), *Args(Node, 0));
 			}
 
-			// Entered through a non-default exec input (Gate.Open, Timeline.Reverse, ...).
-			if (EnteredBy && !IsTunnelBoundary(Node) && ExecPins(Node, EGPD_Input).Num() > 1)
-			{
-				Text += FString::Printf(TEXT(" [in: %s]"), *EnteredBy->GetDisplayName().ToString());
-			}
+			Text += EnteredTag(Node, EnteredBy);
 
 			// Used data outputs get a handle the later expressions refer to.
 			bool bOutputsUsed = false;
@@ -706,6 +716,8 @@ namespace MonolithGraphRenderDetail
 				{
 					if (!Visited.Contains(Node))
 					{
+						// Starting here is one more way in, on top of the links that come back to it.
+						ExecIncoming.FindOrAdd(Node)++;
 						Walk(Node, nullptr, 1);
 					}
 				}
@@ -724,7 +736,7 @@ namespace MonolithGraphRenderDetail
 			if (Visited.Contains(Node))
 			{
 				const FString* Label = Labels.Find(Node);
-				Emit(Indent, FString::Printf(TEXT("goto %s (%s)"), Label ? **Label : TEXT("?"), *NodeName(Node)));
+				Emit(Indent, FString::Printf(TEXT("goto %s (%s)%s"), Label ? **Label : TEXT("?"), *NodeName(Node), *EnteredTag(Node, EnteredBy)));
 				return;
 			}
 			Visited.Add(Node);
@@ -901,17 +913,13 @@ FString FMonolithBlueprintGraphRenderer::DescribeGraph(UBlueprint* Blueprint, UE
 	{
 		return FString::Printf(TEXT("== subgraph %s (in %s) =="), *Graph->GetName(), *ParentGraph);
 	}
-	OutType.ReplaceInline(TEXT("_"), TEXT(" "));
-	FString Type = OutType;
-	OutType = MonolithBlueprintInternal::ClassifyGraphType(Blueprint, Graph, InterfaceName, &ParentGraph);
-	return FString::Printf(TEXT("== %s %s =="), *Type, *Graph->GetName());
+	return FString::Printf(TEXT("== %s %s =="), *OutType.Replace(TEXT("_"), TEXT(" ")), *Graph->GetName());
 }
 
-FString FMonolithBlueprintGraphRenderer::RenderGraph(UBlueprint* Blueprint, UEdGraph* Graph, const FOptions& Options)
+FString FMonolithBlueprintGraphRenderer::RenderGraph(UBlueprint* Blueprint, UEdGraph* Graph, const FOptions& Options, FString& OutType)
 {
 	TArray<FString> Lines;
-	FString Type;
-	Lines.Add(DescribeGraph(Blueprint, Graph, Type));
+	Lines.Add(DescribeGraph(Blueprint, Graph, OutType));
 	MonolithGraphRenderDetail::FGraphRender Render(Graph, Options);
 	Render.Run(Lines);
 	return FString::Join(Lines, TEXT("\n"));
