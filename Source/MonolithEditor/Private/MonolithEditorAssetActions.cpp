@@ -12,7 +12,13 @@
 #include "CoreGlobals.h"          // GIsRunningUnattendedScript
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
+#include "Editor.h"
+#include "Engine/World.h"
+#include "FileHelpers.h"
 #include "Misc/PackageName.h"
+#include "ObjectTools.h"
+#include "Subsystems/AssetEditorSubsystem.h"
+#include "UObject/ObjectRedirector.h"
 #include "UObject/Package.h"
 
 namespace MonolithEditorAssetActionsPrivate
@@ -20,10 +26,10 @@ namespace MonolithEditorAssetActionsPrivate
 	/** One requested duplication, after validation. */
 	struct FDuplicatePair
 	{
+		int32 InputIndex = 0;  // position in the caller's pairs[], which malformed entries do not shift
 		FString SourceInput;   // as the caller wrote it
 		FString DestInput;
 		FString DestPackage;   // normalised long package name, e.g. /Game/Foo/SM_Copy
-		FString DestFolder;    // /Game/Foo
 		FString DestName;      // SM_Copy
 		UObject* Source = nullptr;
 		bool bDestExists = false;
@@ -82,53 +88,18 @@ namespace MonolithEditorAssetActionsPrivate
 		return !OutSource.IsEmpty() && !OutDest.IsEmpty();
 	}
 
-	/** Runs another registered action and returns its result payload, or sets OutError. */
-	static TSharedPtr<FJsonObject> RunNested(const TCHAR* Action, const TSharedPtr<FJsonObject>& Params, FString& OutError)
-	{
-		const FMonolithActionResult Res = FMonolithToolRegistry::Get().ExecuteAction(TEXT("editor"), Action, Params);
-		if (!Res.bSuccess)
-		{
-			OutError = Res.ErrorMessage;
-			return nullptr;
-		}
-		return Res.Result;
-	}
-
-	static bool DeleteExistingDestination(const FString& DestPackage, FString& OutError)
-	{
-		TSharedPtr<FJsonObject> DeleteParams = MakeShared<FJsonObject>();
-		TArray<TSharedPtr<FJsonValue>> Paths;
-		Paths.Add(MakeShared<FJsonValueString>(DestPackage));
-		DeleteParams->SetArrayField(TEXT("asset_paths"), Paths);
-
-		const TSharedPtr<FJsonObject> Res = RunNested(TEXT("delete_assets"), DeleteParams, OutError);
-		if (!Res.IsValid())
-		{
-			OutError = FString::Printf(TEXT("could not delete the existing destination: %s"), *OutError);
-			return false;
-		}
-		bool bOk = false;
-		Res->TryGetBoolField(TEXT("success"), bOk);
-		if (!bOk)
-		{
-			OutError = TEXT("could not delete the existing destination (it is still referenced or in use)");
-			return false;
-		}
-		return true;
-	}
-
 	static bool SaveDestination(const FString& DestPackage, FString& OutError)
 	{
 		TSharedPtr<FJsonObject> SaveParams = MakeShared<FJsonObject>();
-		TArray<TSharedPtr<FJsonValue>> Packages;
-		Packages.Add(MakeShared<FJsonValueString>(DestPackage));
-		SaveParams->SetArrayField(TEXT("packages"), Packages);
+		SaveParams->SetField(TEXT("packages"), FMonolithJsonUtils::StringArrayToJson({ DestPackage }));
 
-		const TSharedPtr<FJsonObject> Res = RunNested(TEXT("save_packages"), SaveParams, OutError);
-		if (!Res.IsValid())
+		const FMonolithActionResult Saved = FMonolithToolRegistry::Get().ExecuteAction(TEXT("editor"), TEXT("save_packages"), SaveParams);
+		if (!Saved.bSuccess || !Saved.Result.IsValid())
 		{
+			OutError = Saved.ErrorMessage;
 			return false;
 		}
+		const TSharedPtr<FJsonObject>& Res = Saved.Result;
 		const TArray<TSharedPtr<FJsonValue>>* Rows = nullptr;
 		if (Res->TryGetArrayField(TEXT("results"), Rows) && Rows && Rows->Num() > 0)
 		{
@@ -154,11 +125,12 @@ namespace MonolithEditorAssetActionsPrivate
 void FMonolithEditorAssetActions::RegisterActions(FMonolithToolRegistry& Registry)
 {
 	Registry.RegisterAction(TEXT("editor"), TEXT("duplicate_asset"),
-		TEXT("Duplicate any asset (StaticMesh, DataAsset, Texture2D, ...) to a new path through IAssetTools::DuplicateAsset. "
+		TEXT("Duplicate any asset (StaticMesh, DataAsset, Texture2D, ...) to a new path through ObjectTools::DuplicateSingleObject. "
 			 "Give source_path + dest_path for one asset, or pairs:[{source, dest}] for a batch in one call. "
 			 "The whole request is validated before anything is written: a missing source, an invalid destination, two pairs "
 			 "with the same destination, or a destination that already exists (unless overwrite=true) refuses the request. "
-			 "overwrite=true deletes the existing destination first and refuses when other packages reference it. "
+			 "overwrite=true replaces the existing destination in its package and refuses when other packages reference it; "
+			 "with save=false the file on disk keeps the old asset until the package is saved. "
 			 "Returns {ok, requested, duplicated, results:[{source, dest, class, overwritten, saved, ok, error?}]}. "
 			 "Type-specific actions (duplicate_blueprint, duplicate_material, ...) remain the better choice for those types."),
 		FMonolithActionHandler::CreateStatic(&HandleDuplicateAsset),
@@ -224,29 +196,54 @@ FMonolithActionResult FMonolithEditorAssetActions::HandleDuplicateAsset(const TS
 		for (int32 Index = 0; Index < PairsArray->Num(); ++Index)
 		{
 			const TSharedPtr<FJsonValue>& Value = (*PairsArray)[Index];
+			const TSharedPtr<FJsonObject>* PairObj = nullptr;
 			FString Source, Dest;
-			if (!Value.IsValid() || !ReadPairStrings(Value->AsObject(), Source, Dest))
+			if (!Value.IsValid() || !Value->TryGetObject(PairObj) || !PairObj || !ReadPairStrings(*PairObj, Source, Dest))
 			{
 				Problems.Add(FString::Printf(TEXT("pairs[%d]: expected an object {source, dest} with two non-empty strings"), Index));
 				continue;
 			}
 			FDuplicatePair& Pair = Pairs.AddDefaulted_GetRef();
+			Pair.InputIndex = Index;
 			Pair.SourceInput = Source;
 			Pair.DestInput = Dest;
 		}
 	}
 
 	// ---- Validate everything before writing anything ----
-	TMap<FString, int32> DestSeen;     // normalised dest package -> pair index
-	for (int32 Index = 0; Index < Pairs.Num(); ++Index)
+	const IAssetTools& AssetTools = FAssetToolsModule::GetModule().Get();
+	TMap<FString, int32> DestSeen;        // normalised dest package -> pairs[] index
+	TMap<FString, int32> SourcePackages;  // source package -> pairs[] index of the first pair reading it
+	for (FDuplicatePair& Pair : Pairs)
 	{
-		FDuplicatePair& Pair = Pairs[Index];
-		const FString Label = bHasPairs ? FString::Printf(TEXT("pairs[%d]: "), Index) : FString();
+		const FString Label = bHasPairs ? FString::Printf(TEXT("pairs[%d]: "), Pair.InputIndex) : FString();
 
 		Pair.Source = FMonolithAssetUtils::LoadAssetByPath(Pair.SourceInput);
+		// A path that predates a rename resolves to the redirector left behind: duplicate what it points at.
+		while (const UObjectRedirector* Redirector = Cast<UObjectRedirector>(Pair.Source))
+		{
+			Pair.Source = Redirector->DestinationObject;
+		}
+		FString SourcePackage;
 		if (!Pair.Source)
 		{
 			Problems.Add(FString::Printf(TEXT("%ssource '%s' not found"), *Label, *Pair.SourceInput));
+		}
+		else if (Pair.Source->IsA<UClass>())
+		{
+			Problems.Add(FString::Printf(TEXT("%ssource '%s' is a class, not an asset (for a Blueprint, pass the Blueprint path without the _C suffix)"), *Label, *Pair.SourceInput));
+		}
+		else if (Pair.Source->GetOutermost()->HasAnyPackageFlags(PKG_FilterEditorOnly))
+		{
+			Problems.Add(FString::Printf(TEXT("%ssource '%s' is in a cooked package, which cannot be duplicated"), *Label, *Pair.SourceInput));
+		}
+		else
+		{
+			SourcePackage = Pair.Source->GetOutermost()->GetName();
+			if (!SourcePackages.Contains(SourcePackage))
+			{
+				SourcePackages.Add(SourcePackage, Pair.InputIndex);
+			}
 		}
 
 		const FString PathError = MonolithCore::ValidatePackagePath(Pair.DestInput, Pair.DestPackage);
@@ -255,10 +252,23 @@ FMonolithActionResult FMonolithEditorAssetActions::HandleDuplicateAsset(const TS
 			Problems.Add(FString::Printf(TEXT("%sdest: %s"), *Label, *PathError));
 			continue;
 		}
-		Pair.DestFolder = FPackageName::GetLongPackagePath(Pair.DestPackage);
 		Pair.DestName = FPackageName::GetShortName(Pair.DestPackage);
 
-		if (Pair.Source && Pair.Source->GetOutermost()->GetName() == Pair.DestPackage)
+		// A long package name allows characters an object name does not, e.g. "SM_Copy(1)".
+		FText NameReason;
+		if (!FName(*Pair.DestName).IsValidObjectName(NameReason))
+		{
+			Problems.Add(FString::Printf(TEXT("%sdest '%s': invalid asset name: %s"), *Label, *Pair.DestInput, *NameReason.ToString()));
+			continue;
+		}
+		FText PathReason;
+		if (!AssetTools.IsObjectPathAllowed(Pair.DestPackage, &PathReason))
+		{
+			Problems.Add(FString::Printf(TEXT("%sdest '%s' is not allowed: %s"), *Label, *Pair.DestInput, *PathReason.ToString()));
+			continue;
+		}
+
+		if (SourcePackage == Pair.DestPackage)
 		{
 			Problems.Add(FString::Printf(TEXT("%sdest '%s' is the source itself"), *Label, *Pair.DestInput));
 			continue;
@@ -268,7 +278,7 @@ FMonolithActionResult FMonolithEditorAssetActions::HandleDuplicateAsset(const TS
 			Problems.Add(FString::Printf(TEXT("%sdest '%s' is also the destination of pairs[%d]"), *Label, *Pair.DestPackage, *Earlier));
 			continue;
 		}
-		DestSeen.Add(Pair.DestPackage, Index);
+		DestSeen.Add(Pair.DestPackage, Pair.InputIndex);
 
 		Pair.bDestExists = PackageHasAsset(Pair.DestPackage);
 		if (Pair.bDestExists)
@@ -276,6 +286,13 @@ FMonolithActionResult FMonolithEditorAssetActions::HandleDuplicateAsset(const TS
 			if (!bOverwrite)
 			{
 				Problems.Add(FString::Printf(TEXT("%sdest '%s' already exists (pass overwrite: true to replace it)"), *Label, *Pair.DestPackage));
+				continue;
+			}
+			// The copy is written into the destination's package: replacing a map by an asset, or an
+			// asset by a map, would leave both a .umap and a .uasset for one package name.
+			if (FEditorFileUtils::IsMapPackageAsset(Pair.DestPackage) || (Pair.Source && Pair.Source->IsA<UWorld>()))
+			{
+				Problems.Add(FString::Printf(TEXT("%sdest '%s' exists and overwrite does not support maps: delete the destination first"), *Label, *Pair.DestPackage));
 				continue;
 			}
 			const TArray<FString> Referencers = GetReferencerPackages(Pair.DestPackage);
@@ -292,39 +309,26 @@ FMonolithActionResult FMonolithEditorAssetActions::HandleDuplicateAsset(const TS
 	}
 
 	// A destination that is also a source in the same batch would make the result depend on order.
-	for (int32 Index = 0; Index < Pairs.Num(); ++Index)
+	// A pair whose destination is its own source is already reported above.
+	for (const FDuplicatePair& Pair : Pairs)
 	{
-		const FString& Dest = Pairs[Index].DestPackage;
-		if (Dest.IsEmpty())
+		const int32* Reader = SourcePackages.Find(Pair.DestPackage);
+		if (Reader && *Reader != Pair.InputIndex)
 		{
-			continue;
-		}
-		for (int32 Other = 0; Other < Pairs.Num(); ++Other)
-		{
-			if (Other != Index && Pairs[Other].Source && Pairs[Other].Source->GetOutermost()->GetName() == Dest)
-			{
-				Problems.Add(FString::Printf(TEXT("pairs[%d]: dest '%s' is the source of pairs[%d]"), Index, *Dest, Other));
-				break;
-			}
+			Problems.Add(FString::Printf(TEXT("pairs[%d]: dest '%s' is the source of pairs[%d]"), Pair.InputIndex, *Pair.DestPackage, *Reader));
 		}
 	}
 
 	if (Problems.Num() > 0)
 	{
 		TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
-		TArray<TSharedPtr<FJsonValue>> ProblemValues;
-		for (const FString& P : Problems)
-		{
-			ProblemValues.Add(MakeShared<FJsonValueString>(P));
-		}
-		Data->SetArrayField(TEXT("problems"), ProblemValues);
+		Data->SetField(TEXT("problems"), FMonolithJsonUtils::StringArrayToJson(Problems));
 		return FMonolithActionResult::Error(
 			FString::Printf(TEXT("duplicate_asset refused, nothing was written: %s"), *FString::Join(Problems, TEXT("; "))),
 			InvalidParams).WithErrorData(Data);
 	}
 
 	// ---- Execute ----
-	IAssetTools& AssetTools = FAssetToolsModule::GetModule().Get();
 	TArray<TSharedPtr<FJsonValue>> Rows;
 	int32 DuplicatedCount = 0;
 	FString FirstError;
@@ -348,30 +352,58 @@ FMonolithActionResult FMonolithEditorAssetActions::HandleDuplicateAsset(const TS
 			}
 		};
 
+		// Same preparation as delete_assets for the asset being replaced: a dirty package would raise
+		// a save prompt when its editor closes, and an open editor holds a reference to it.
+		bool bExistingWasDirty = false;
 		if (Pair.bDestExists)
 		{
-			FString DeleteError;
-			if (!DeleteExistingDestination(Pair.DestPackage, DeleteError))
+			if (UObject* Existing = FMonolithAssetUtils::LoadAssetByPath(Pair.DestPackage))
 			{
-				Fail(DeleteError);
-				continue;
+				UPackage* ExistingPackage = Existing->GetOutermost();
+				bExistingWasDirty = ExistingPackage->IsDirty();
+				ExistingPackage->SetDirtyFlag(false);
+				if (UAssetEditorSubsystem* AssetEditors = GEditor ? GEditor->GetEditorSubsystem<UAssetEditorSubsystem>() : nullptr)
+				{
+					AssetEditors->CloseAllEditorsForAsset(Existing);
+				}
 			}
-			Row->SetBoolField(TEXT("overwritten"), true);
 		}
 
+		// ObjectTools::DuplicateSingleObject is what IAssetTools::DuplicateAsset runs, minus two things
+		// an unattended action cannot afford: AssetTools refuses an existing destination outright, and
+		// with source control enabled it saves the copy through a checkout prompt (a modal dialog).
+		// DuplicateSingleObject replaces an existing destination itself and keeps its package rooted
+		// meanwhile, so the file is neither removed nor opened for delete: saving the copy is then an
+		// ordinary edit of that file.
 		UObject* Duplicated = nullptr;
 		{
-			// AssetTools reports some failures through message dialogs; a non-interactive action
-			// must never raise a modal (it blocks the game thread and the MCP server with it).
+			// ObjectTools reports failures through message dialogs; a non-interactive action must
+			// never raise a modal (it blocks the game thread and the MCP server with it).
 			TGuardValue<bool> UnattendedGuard(GIsRunningUnattendedScript, true);
-			Duplicated = AssetTools.DuplicateAsset(Pair.DestName, Pair.DestFolder, Pair.Source);
+			ObjectTools::FPackageGroupName Target;
+			Target.PackageName = Pair.DestPackage;
+			Target.ObjectName = Pair.DestName;
+			TSet<UPackage*> PackagesNotFullyLoaded;
+			Duplicated = ObjectTools::DuplicateSingleObject(Pair.Source, Target, PackagesNotFullyLoaded, /*bPromptToOverwrite=*/false);
 		}
 		if (!Duplicated)
 		{
-			Fail(TEXT("IAssetTools::DuplicateAsset returned null (see the editor log)"));
+			if (bExistingWasDirty)
+			{
+				UPackage* ExistingPackage = FindPackage(nullptr, *Pair.DestPackage);
+				if (ExistingPackage && ExistingPackage->FindAssetInPackage())
+				{
+					ExistingPackage->SetDirtyFlag(true);
+				}
+			}
+			Fail(Pair.bDestExists
+				? TEXT("the existing destination could not be replaced; its package file on disk is untouched (see the editor log)")
+				: TEXT("ObjectTools::DuplicateSingleObject returned null (see the editor log)"));
 			continue;
 		}
+		Duplicated->SetFlags(RF_Public | RF_Standalone);
 
+		Row->SetBoolField(TEXT("overwritten"), Pair.bDestExists);
 		Row->SetStringField(TEXT("dest"), Duplicated->GetPathName());
 		Row->SetStringField(TEXT("class"), Duplicated->GetClass()->GetPathName());
 		++DuplicatedCount;

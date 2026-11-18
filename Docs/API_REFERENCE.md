@@ -781,7 +781,7 @@ Runs non-interactively: each target's package dirty flag is cleared and any open
 
 ### `editor.duplicate_asset`
 
-Duplicate any asset (StaticMesh, DataAsset, Texture2D, ...) to a new path through `IAssetTools::DuplicateAsset`. Prefer the type-specific actions (`duplicate_blueprint`, `duplicate_material`, ...) for those types.
+Duplicate any asset (StaticMesh, DataAsset, Texture2D, ...) to a new path through `ObjectTools::DuplicateSingleObject`. Prefer the type-specific actions (`duplicate_blueprint`, `duplicate_material`, ...) for those types.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -791,7 +791,7 @@ Duplicate any asset (StaticMesh, DataAsset, Texture2D, ...) to a new path throug
 | `overwrite` | bool | optional | Replace an existing destination. Default: `false` (refuse) |
 | `save` | bool | optional | Save each copy to disk. Default: `true` |
 
-The whole request is validated before anything is written. A missing source, an invalid destination, two pairs sharing a destination, a destination that is a source in the same request, or an existing destination without `overwrite` refuses it with `-32602`; `error.data.problems` lists every problem. With `overwrite: true`, a destination that other packages reference is refused (overwriting it would break those references); otherwise it is deleted first.
+The whole request is validated before anything is written. A missing source, a source that is a class or sits in a cooked package, an invalid destination (path or asset name), two pairs sharing a destination, a destination that is a source in the same request, or an existing destination without `overwrite` refuses it with `-32602`; `error.data.problems` lists every problem, each `pairs[N]` being the index in the request. A source path that resolves to a redirector duplicates the asset it points at. With `overwrite: true`, a destination that other packages reference is refused (overwriting it would break those references), and so is a map on either side; otherwise the copy replaces the asset inside the destination's package. The file on disk is not deleted: saving the copy rewrites it (an ordinary edit under source control), and with `save: false`, or when the replacement fails, it still holds the old asset.
 
 **Result:** `{ok, requested, duplicated, results: [{source, dest, class, overwritten, saved, ok, error?}], first_error?}`. A batch reports per-pair failures in its rows; the single form returns an error when its pair fails.
 

@@ -1,14 +1,16 @@
 // =============================================================================
 // MonolithDuplicateAssetTests.cpp
 //
-// editor.duplicate_asset — generic duplication through IAssetTools.
+// editor.duplicate_asset - generic duplication through ObjectTools.
 //
 //   - Monolith.Editor.DuplicateAsset.Types
 //       duplicates a StaticMesh, a DataAsset and a Texture2D (single form and batch form),
 //       checks each copy's class and that its package is saved to disk.
 //   - Monolith.Editor.DuplicateAsset.Refusals
 //       neither/both forms, missing source, an existing destination without overwrite,
-//       two pairs with one destination: each refuses with -32602 and writes nothing.
+//       two pairs with one destination, a destination that is its own source or another
+//       pair's source, a malformed pairs entry, a class source, an invalid asset name:
+//       each refuses with -32602 and writes nothing.
 //   - Monolith.Editor.DuplicateAsset.OverwriteAndNoSave
 //       overwrite=true replaces an existing destination; save=false leaves the copy unsaved.
 //
@@ -30,6 +32,7 @@
 #include "Engine/StaticMesh.h"
 #include "Engine/Texture2D.h"
 #include "UObject/Package.h"
+#include "AssetRegistry/AssetData.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 
 #include "MonolithJsonUtils.h"
@@ -233,6 +236,56 @@ bool FMonolithDuplicateAssetRefusalsTest::RunTest(const FString& /*Parameters*/)
 		TestTrue(TEXT("Error points at overwrite"), Res.ErrorMessage.Contains(TEXT("overwrite")));
 		TestNotNull(TEXT("Existing destination is untouched (still a mesh)"),
 			LoadObject<UStaticMesh>(nullptr, *(Dest + TEXT(".SM_Existing"))));
+
+		// Duplicating an asset onto itself is refused even with overwrite.
+		TSharedPtr<FJsonObject> Self = Single(Dest, Dest);
+		Self->SetBoolField(TEXT("overwrite"), true);
+		const FMonolithActionResult SelfRes = Run(Self);
+		TestFalse(TEXT("Self destination refuses"), SelfRes.bSuccess);
+		TestEqual(TEXT("Self destination is invalid params"), SelfRes.ErrorCode, InvalidParams);
+		TestTrue(TEXT("Self destination error names it"), SelfRes.ErrorMessage.Contains(TEXT("source itself")));
+
+		// A destination that another pair reads from would make the batch depend on order.
+		const FString Chained = Folder.Path(TEXT("SM_Chained"));
+		TSharedPtr<FJsonObject> Chain = MakeShared<FJsonObject>();
+		TArray<TSharedPtr<FJsonValue>> ChainPairs;
+		ChainPairs.Add(Pair(EngineTexture, Dest));
+		ChainPairs.Add(Pair(Dest, Chained));
+		Chain->SetArrayField(TEXT("pairs"), ChainPairs);
+		Chain->SetBoolField(TEXT("overwrite"), true);
+		const FMonolithActionResult ChainRes = Run(Chain);
+		TestFalse(TEXT("Destination read by another pair refuses"), ChainRes.bSuccess);
+		TestEqual(TEXT("Destination read by another pair is invalid params"), ChainRes.ErrorCode, InvalidParams);
+		TestTrue(TEXT("Error names both pairs"), ChainRes.ErrorMessage.Contains(TEXT("pairs[0]")) && ChainRes.ErrorMessage.Contains(TEXT("source of pairs[1]")));
+		TestFalse(TEXT("Nothing written for the chained batch"), OnDisk(Chained));
+		TestNotNull(TEXT("Chained destination is untouched (still a mesh)"),
+			LoadObject<UStaticMesh>(nullptr, *(Dest + TEXT(".SM_Existing"))));
+	}
+	{
+		// A malformed entry does not shift the index reported for the entries after it.
+		TSharedPtr<FJsonObject> Params = MakeShared<FJsonObject>();
+		TArray<TSharedPtr<FJsonValue>> Pairs;
+		Pairs.Add(MakeShared<FJsonValueString>(TEXT("not an object")));
+		Pairs.Add(Pair(TEXT("/Game/Tests/Monolith/DuplicateAsset/DoesNotExist"), Folder.Path(TEXT("SM_Indexed"))));
+		Params->SetArrayField(TEXT("pairs"), Pairs);
+		const FMonolithActionResult Res = Run(Params);
+		TestFalse(TEXT("Malformed entry refuses"), Res.bSuccess);
+		TestEqual(TEXT("Malformed entry is invalid params"), Res.ErrorCode, InvalidParams);
+		TestTrue(TEXT("Malformed entry is reported at its index"), Res.ErrorMessage.Contains(TEXT("pairs[0]: expected an object")));
+		TestTrue(TEXT("Later entry keeps its own index"), Res.ErrorMessage.Contains(TEXT("pairs[1]: source")));
+	}
+	{
+		// A class is not an asset: the generated class of a Blueprint, or a native class.
+		const FString Dest = Folder.Path(TEXT("SM_FromClass"));
+		const FMonolithActionResult Res = Run(Single(TEXT("/Script/Engine.Actor"), Dest));
+		TestFalse(TEXT("Class source refuses"), Res.bSuccess);
+		TestEqual(TEXT("Class source is invalid params"), Res.ErrorCode, InvalidParams);
+		TestFalse(TEXT("Nothing written for a class source"), OnDisk(Dest));
+	}
+	{
+		const FMonolithActionResult Res = Run(Single(EngineMesh, Folder.Path(TEXT("SM_Bad(1)"))));
+		TestFalse(TEXT("Invalid asset name refuses"), Res.bSuccess);
+		TestEqual(TEXT("Invalid asset name is invalid params"), Res.ErrorCode, InvalidParams);
 	}
 	{
 		// Two pairs, one destination: refused as a whole, so the first pair is not written either.
