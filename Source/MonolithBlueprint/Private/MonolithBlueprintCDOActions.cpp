@@ -11,9 +11,6 @@
 #include "UObject/UnrealType.h"
 #include "Engine/Blueprint.h"
 #include "Kismet2/BlueprintEditorUtils.h"
-#include "Serialization/JsonWriter.h"
-#include "Serialization/JsonSerializer.h"
-#include "JsonObjectConverter.h"
 #include "StructUtils/InstancedStruct.h"
 #include "ScopedTransaction.h"
 #include "MonolithBlueprintEditCradle.h"
@@ -52,7 +49,9 @@ void FMonolithBlueprintCDOActions::RegisterActions(FMonolithToolRegistry& Regist
 	Registry.RegisterAction(TEXT("blueprint"), TEXT("set_cdo_property"),
 		TEXT("Set a property value on a Blueprint CDO or UObject asset (DataAsset, GameplayEffect, etc.). "
 			 "Write counterpart to get_cdo_properties. Supports numeric, boolean, string, enum, struct, "
-			 "and any type that supports ImportText."),
+			 "and any type that supports ImportText. A JSON object or array value is written like "
+			 "set_cdo_properties: arrays, maps and sets are rebuilt from the JSON, a key the type "
+			 "does not have is an error, and an instanced struct is an object with '__struct'."),
 		FMonolithActionHandler::CreateStatic(&HandleSetCDOProperty),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Blueprint or UObject asset path (e.g. /Game/Data/DA_MyData)"))
@@ -473,22 +472,32 @@ FMonolithActionResult FMonolithBlueprintCDOActions::HandleSetCDOProperty(const T
 
 	if (JsonVal->Type == EJson::Object || JsonVal->Type == EJson::Array)
 	{
-		// Use FJsonObjectConverter for complex types (structs, TMaps, TArrays)
-		if (!FJsonObjectConverter::JsonValueToUProperty(JsonVal, Prop, ValuePtr, 0, 0))
+		// Same walker as set_cdo_properties and the dry run above, so a write the dry run
+		// approves is the write that happens (instanced structs with __struct included).
+		FBulkFillSpec Spec;
+		Spec.TargetNamespace = TEXT("blueprint");
+		Spec.TargetAsset = AssetPath;
+		FDryRunReport Report;
+		const FBulkFillFieldWrite W = FMonolithReflectionWalker::WriteLeaf(
+			Prop, ValuePtr, JsonVal, TargetObject, Spec, Report, Prop->GetName());
+		if (!W.bOk)
 		{
-			// Serialize the JSON value for error reporting (truncated)
-			FString JsonStr;
-			TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&JsonStr);
-			FJsonSerializer::Serialize(JsonVal.ToSharedRef(), TEXT("value"), Writer);
-			Writer->Close();
-			if (JsonStr.Len() > 500) { JsonStr = JsonStr.Left(500) + TEXT("..."); }
+			// The nested writes carry the detail; the leaf only counts them.
+			TArray<FString> Reasons;
+			for (const FBulkFillFieldWrite& Nested : Report.FieldWrites)
+			{
+				if (!Nested.bOk)
+				{
+					Reasons.Add(FString::Printf(TEXT("%s: %s"), *Nested.Path, *Nested.Reason));
+				}
+			}
+			Reasons.Add(FString::Printf(TEXT("%s: %s"), *W.Path, *W.Reason));
 
 			// Cancel the transaction so the failed-write doesn't pollute the undo buffer
 			Transaction.Cancel();
 			return FMonolithActionResult::Error(FString::Printf(
-				TEXT("Failed to set property '%s' from JSON — FJsonObjectConverter rejected the format. "
-					 "Ensure the JSON structure matches the UProperty layout. Preview: %s"),
-				*PropertyName, *JsonStr));
+				TEXT("Failed to set property '%s' from JSON: %s"),
+				*PropertyName, *FString::Join(Reasons, TEXT("; "))));
 		}
 	}
 	else

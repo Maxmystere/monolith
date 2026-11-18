@@ -10,6 +10,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **Property paths and JSON trees go through `TInstancedStruct` / `FInstancedStruct`.** `set_property_at_path` stopped at an instanced struct (`Fragments[1].EquipmentMesh` on a `TArray<TInstancedStruct<FItemFragmentBase>>` failed with `unknown field 'EquipmentMesh' on InstancedStruct`). The path walker now continues into the struct the element holds; a path through an empty instance fails with an error that says to write the whole element first (`path 'Fragments[2]'`, value `/Script/Module.StructName(Field=...)`). `set_cdo_properties` and `bulk_fill` accept an instanced struct as a JSON object: `__struct` (the key `get_cdo_properties` already emits) selects or changes the held type, checked against the `TInstancedStruct<T>` base, and the other keys are written into it, so a read -> edit -> write round trip works: an empty instance reads and writes as `{}`, a null hard reference as `None`. `describe_cdo_schema` gives an instanced struct the literal form `/Script/Module.StructName(Field1=...,Field2=...)`.
 
+### Changed
+
+- **`set_cdo_property` writes JSON object and array values through the reflection walker (behaviour change).** Its dry run already used the walker while the write used `FJsonObjectConverter`, so a dry run could approve a value the write handled differently: an array of instanced-struct objects (`[{"__struct": ..., "Weight": 7}]`) passed the dry run and was then written as empty instances, with a success result. The write now takes the same path as `set_cdo_properties`: arrays, maps and sets are rebuilt from the JSON (array elements are no longer merged by index into the existing ones), a key the type does not have fails the call with the field named instead of being dropped, and instanced structs take `__struct`. String, number and bool values still go through ImportText. An inline subobject (a JSON object on an object reference, with `_ClassName`) is still built by `FJsonObjectConverter`, now from the walker, so `set_cdo_properties`, `bulk_fill` and `set_property_at_path` build it too instead of writing a null reference.
+
 ### Fixed
 
 

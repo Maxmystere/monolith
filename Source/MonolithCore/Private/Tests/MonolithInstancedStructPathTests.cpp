@@ -25,6 +25,9 @@
 //   - Monolith.Core.InstancedStructPaths.ReadWriteRoundTrip
 //       what get_cdo_properties returns for Fragments (an empty element as {}, a null hard
 //       reference as "None") writes back through set_cdo_properties without errors.
+//   - Monolith.Core.InstancedStructPaths.SetCdoPropertyTree
+//       set_cdo_property with a JSON array value writes what its dry run approved (typed
+//       elements, not empty instances) and fails on a key the held struct does not have.
 //
 // The asset lives in an in-memory package and is never saved.
 // =============================================================================
@@ -342,6 +345,56 @@ bool FMonolithInstancedStructRoundTripTest::RunTest(const FString& /*Parameters*
 			&& F.MeshAt(1)->EquipmentMesh.IsNull() && F.MeshAt(1)->PreviewMesh == nullptr);
 		TestFalse(TEXT("Empty element stays empty"), F.Asset->Fragments[2].IsValid());
 	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMonolithInstancedStructSetCdoPropertyTest,
+	"Monolith.Core.InstancedStructPaths.SetCdoPropertyTree",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithInstancedStructSetCdoPropertyTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MonolithInstancedStructPathTests;
+	FFixture F;
+
+	auto MakeParams = [&F](const TCHAR* WeightKey, bool bDryRun)
+	{
+		TSharedPtr<FJsonObject> Element = MakeShared<FJsonObject>();
+		Element->SetStringField(TEXT("__struct"), MeshFragmentPath);
+		Element->SetNumberField(WeightKey, 9);
+		Element->SetStringField(TEXT("Socket"), TEXT("Back"));
+		TArray<TSharedPtr<FJsonValue>> Elements;
+		Elements.Add(MakeShared<FJsonValueObject>(Element));
+
+		TSharedPtr<FJsonObject> P = MakeShared<FJsonObject>();
+		P->SetStringField(TEXT("asset_path"), F.Path);
+		P->SetStringField(TEXT("property_name"), TEXT("Fragments"));
+		P->SetArrayField(TEXT("value"), Elements);
+		P->SetBoolField(TEXT("dry_run"), bDryRun);
+		return P;
+	};
+
+	const FMonolithActionResult Dry = Run(TEXT("set_cdo_property"), MakeParams(TEXT("Weight"), /*bDryRun=*/true));
+	if (TestTrue(FString::Printf(TEXT("Dry run succeeds (%s)"), *Dry.ErrorMessage), Dry.bSuccess))
+	{
+		TestEqual(TEXT("Dry run reports no errors"), static_cast<int32>(Dry.Result->GetNumberField(TEXT("errors"))), 0);
+	}
+	TestEqual(TEXT("Dry run leaves the array alone"), F.Asset->Fragments.Num(), 3);
+
+	// The write does what the dry run approved: one typed element, not an empty instance.
+	const FMonolithActionResult Real = Run(TEXT("set_cdo_property"), MakeParams(TEXT("Weight"), /*bDryRun=*/false));
+	TestTrue(FString::Printf(TEXT("Write succeeds (%s)"), *Real.ErrorMessage), Real.bSuccess);
+	if (TestEqual(TEXT("Array rebuilt with one element"), F.Asset->Fragments.Num(), 1))
+	{
+		TestTrue(TEXT("Element is the mesh fragment with its fields"),
+			F.MeshAt(0) && F.MeshAt(0)->Weight == 9 && F.MeshAt(0)->Socket == FName(TEXT("Back")));
+	}
+
+	// A key the held struct does not have is an error, not a silent drop.
+	const FMonolithActionResult Bad = Run(TEXT("set_cdo_property"), MakeParams(TEXT("Wieght"), /*bDryRun=*/false));
+	TestFalse(TEXT("Unknown key fails the write"), Bad.bSuccess);
+	TestTrue(FString::Printf(TEXT("The error names the key (%s)"), *Bad.ErrorMessage), Bad.ErrorMessage.Contains(TEXT("Wieght")));
 	return true;
 }
 
