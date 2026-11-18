@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`editor duplicate_asset`.** Duplicates any asset (StaticMesh, DataAsset, Texture2D, ...) through `IAssetTools::DuplicateAsset`, which until now only had per-type actions (`duplicate_blueprint`, `duplicate_material`, ...). Single form `source_path` + `dest_path`, or a batch `pairs: [{source, dest}]` in one call. The whole request is validated before anything is written: a missing source, an invalid destination, two pairs sharing a destination, or a destination that already exists refuses it with `-32602`. `overwrite: true` deletes the existing destination first (through `delete_assets`) and refuses when other packages reference it; `save` (default true) saves each copy through `save_packages`. Rows report `source`, `dest`, `class`, `overwritten`, `saved`.
+
 ## [0.25.0] - 2026-11-20
 
 > **Action count is approximate.** **~1,500+ actions across 27 in-tree namespaces** - query `monolith_discover()` for the live figure.

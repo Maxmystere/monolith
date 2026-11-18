@@ -779,6 +779,22 @@ Runs non-interactively: each target's package dirty flag is cleared and any open
 
 > **Known limitation.** A NiagaraScript created and compiled in the same session can't be deleted until its compile state clears — a transient compilation graph holds a reference (the engine's own Content Browser hits the same wall). It becomes deletable after the state clears, e.g. on editor restart.
 
+### `editor.duplicate_asset`
+
+Duplicate any asset (StaticMesh, DataAsset, Texture2D, ...) to a new path through `IAssetTools::DuplicateAsset`. Prefer the type-specific actions (`duplicate_blueprint`, `duplicate_material`, ...) for those types.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `source_path` | string | single form | Asset to duplicate, e.g. `/Game/Meshes/SM_Rock` (or `/Game/Meshes/SM_Rock.SM_Rock`) |
+| `dest_path` | string | single form | Destination; the asset name is the last segment |
+| `pairs` | array | batch form | `[{source, dest}, ...]`, instead of `source_path`/`dest_path` |
+| `overwrite` | bool | optional | Replace an existing destination. Default: `false` (refuse) |
+| `save` | bool | optional | Save each copy to disk. Default: `true` |
+
+The whole request is validated before anything is written. A missing source, an invalid destination, two pairs sharing a destination, a destination that is a source in the same request, or an existing destination without `overwrite` refuses it with `-32602`; `error.data.problems` lists every problem. With `overwrite: true`, a destination that other packages reference is refused (overwriting it would break those references); otherwise it is deleted first.
+
+**Result:** `{ok, requested, duplicated, results: [{source, dest, class, overwritten, saved, ok, error?}], first_error?}`. A batch reports per-pair failures in its rows; the single form returns an error when its pair fails.
+
 ### `editor.get_viewport_info`
 
 Current editor viewport camera position, rotation, FOV, resolution. *No parameters.*
