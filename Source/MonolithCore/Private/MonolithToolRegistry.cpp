@@ -3,6 +3,7 @@
 #include "MonolithParamSchema.h"
 #include "MonolithFuzzyMatch.h"
 #include "HAL/PlatformMisc.h"
+#include "Editor.h"
 #include "Dom/JsonValue.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -125,6 +126,9 @@ TArray<FString> FMonolithParamSchema::FindUnknownKeys(
 	// treatment as the original three.
 	Allowed.Add(TEXT("_row_fields"));
 	Allowed.Add(TEXT("_path_fields"));
+	// PIE guard escape hatch, accepted on every action. Consumed and removed by
+	// ExecuteAction before the handler runs.
+	Allowed.Add(TEXT("allow_during_pie"));
 
 	for (const auto& Pair : Params->Values)
 	{
@@ -554,11 +558,39 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 		}
 	}
 
+	// PIE guard: refuse a write while Play In Editor runs, unless the call opts in with
+	// allow_during_pie. Only the outermost dispatch is checked: a handler that calls
+	// other actions (batch / nested ExecuteAction) was already allowed through.
+	bool bAllowDuringPie = false;
+	{
+		const TSharedPtr<FJsonValue> AllowValue = EffectiveParams->TryGetField(TEXT("allow_during_pie"));
+		if (AllowValue.IsValid())
+		{
+			FString AsString;
+			bAllowDuringPie = AllowValue->TryGetBool(bAllowDuringPie) ? bAllowDuringPie
+				: (AllowValue->TryGetString(AsString) && (AsString.Equals(TEXT("true"), ESearchCase::IgnoreCase) || AsString == TEXT("1")));
+		}
+		EffectiveParams->RemoveField(TEXT("allow_during_pie"));
+	}
+	static thread_local int32 DispatchDepth = 0;
+	if (DispatchDepth == 0 && !bAllowDuringPie && IsWriteDuringPie(ActionInfo) && IsPieRunning())
+	{
+		TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+		Data->SetBoolField(TEXT("pie_running"), true);
+		Data->SetStringField(TEXT("action"), Key);
+		return FMonolithActionResult::Error(
+			FString::Printf(TEXT("PIE is running: '%s:%s' changes editor or asset state and is refused during Play In Editor. Stop PIE (editor stop_pie), or pass allow_during_pie: true to run it anyway."),
+				*Namespace, *Action),
+			FMonolithJsonUtils::ErrPieRunning).WithErrorData(Data);
+	}
+
 	// Release lock before executing handler (handlers may take time)
 	FMonolithActionHandler HandlerCopy = RegAction->Handler;
 	Lock.Unlock();
 
+	++DispatchDepth;
 	FMonolithActionResult ActionResult = HandlerCopy.Execute(EffectiveParams);
+	--DispatchDepth;
 
 	// Collect ALL post-handler warnings into a single channel, then attach once.
 	// Sources, in order:
@@ -648,6 +680,73 @@ int32 FMonolithToolRegistry::GetActionCount() const
 {
 	FScopeLock Lock(&RegistryLock);
 	return Actions.Num();
+}
+
+void FMonolithToolRegistry::SetActionPiePolicy(const FString& Namespace, const FString& Action, EMonolithPiePolicy Policy)
+{
+	FScopeLock Lock(&RegistryLock);
+	if (FRegisteredAction* RegAction = Actions.Find(MakeKey(Namespace, Action)))
+	{
+		RegAction->Info.PiePolicy = Policy;
+	}
+}
+
+bool FMonolithToolRegistry::IsReadActionName(const FString& Action)
+{
+	// Verbs that only read editor or asset state. Captures and previews render to files
+	// or transient scenes, never into assets, so they count as reads too.
+	static const TCHAR* ReadPrefixes[] = {
+		TEXT("get_"), TEXT("list_"), TEXT("find_"), TEXT("search_"), TEXT("describe_"), TEXT("export_"),
+		TEXT("render_"), TEXT("query_"), TEXT("read_"), TEXT("validate_"), TEXT("analyze_"), TEXT("audit_"),
+		TEXT("compare_"), TEXT("diff_"), TEXT("lint_"), TEXT("inspect_"), TEXT("preview_"), TEXT("capture_"),
+		TEXT("check_"), TEXT("verify_"), TEXT("detect_"), TEXT("scan_"), TEXT("explain_"), TEXT("estimate_"),
+		TEXT("evaluate_"), TEXT("measure_"), TEXT("predict_"), TEXT("classify_"), TEXT("suggest_"),
+		TEXT("trace_"), TEXT("resolve_"), TEXT("poll_"), TEXT("tail_"), TEXT("sample_"), TEXT("snapshot_"),
+		TEXT("visualize_"), TEXT("simulate_"), TEXT("test_"), TEXT("count_"), TEXT("dump_"), TEXT("can_"),
+		TEXT("is_"), TEXT("has_"),
+	};
+	for (const TCHAR* Prefix : ReadPrefixes)
+	{
+		if (Action.StartsWith(Prefix, ESearchCase::CaseSensitive))
+		{
+			return true;
+		}
+	}
+	// Single-word probes.
+	return Action == TEXT("ping") || Action == TEXT("status") || Action.StartsWith(TEXT("hello_"));
+}
+
+bool FMonolithToolRegistry::IsWriteDuringPie(const FMonolithActionInfo& Info)
+{
+	switch (Info.PiePolicy)
+	{
+	case EMonolithPiePolicy::Read:
+	case EMonolithPiePolicy::AllowDuringPie:
+		return false;
+	case EMonolithPiePolicy::Write:
+		return true;
+	case EMonolithPiePolicy::Auto:
+	default:
+		return !Info.bReadOnlyHint && !IsReadActionName(Info.Action);
+	}
+}
+
+bool FMonolithToolRegistry::IsPieRunning() const
+{
+	{
+		FScopeLock Lock(&RegistryLock);
+		if (PieRunningOverride.IsSet())
+		{
+			return PieRunningOverride.GetValue();
+		}
+	}
+	return GEditor && (GEditor->PlayWorld != nullptr || GEditor->IsPlaySessionInProgress());
+}
+
+void FMonolithToolRegistry::SetPieRunningOverride(TOptional<bool> Override)
+{
+	FScopeLock Lock(&RegistryLock);
+	PieRunningOverride = Override;
 }
 
 void FMonolithToolRegistry::SetDispatcherAnnotations(

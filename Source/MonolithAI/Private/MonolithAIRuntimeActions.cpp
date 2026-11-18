@@ -373,6 +373,17 @@ void FMonolithAIRuntimeActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.RequiredAssetPath(TEXT("query_path"), TEXT("EQS query asset path (e.g. /Game/AI/EQS/EQS_FindCover)"))
 			.Optional(TEXT("max_results"), TEXT("number"), TEXT("Max results to return (default 10)"))
 			.Build());
+
+	// These act on the live PIE world: the registry's PIE guard must let them through.
+	for (const TCHAR* Action : {
+		TEXT("runtime_get_bb_value"), TEXT("runtime_set_bb_value"), TEXT("runtime_clear_bb_value"),
+		TEXT("runtime_get_bt_state"), TEXT("runtime_start_bt"), TEXT("runtime_stop_bt"),
+		TEXT("runtime_get_bt_execution_path"), TEXT("runtime_get_perceived_actors"), TEXT("runtime_check_perception"),
+		TEXT("runtime_report_noise"), TEXT("runtime_get_st_active_states"), TEXT("runtime_send_st_event"),
+		TEXT("runtime_find_smart_objects"), TEXT("runtime_run_eqs_query") })
+	{
+		Registry.SetActionPiePolicy(TEXT("ai"), Action, EMonolithPiePolicy::AllowDuringPie);
+	}
 }
 
 // ============================================================

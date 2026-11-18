@@ -48,6 +48,23 @@ struct FMonolithActionResult
 /** Delegate type for action handlers */
 DECLARE_DELEGATE_RetVal_OneParam(FMonolithActionResult, FMonolithActionHandler, const TSharedPtr<FJsonObject>& /* Params */);
 
+/**
+ * How the registry's PIE guard treats an action while Play In Editor is running.
+ * A write refused during PIE returns ErrPieRunning unless the call passes
+ * allow_during_pie: true.
+ */
+enum class EMonolithPiePolicy : uint8
+{
+	/** Decided by the action: bReadOnlyHint, else its name (FMonolithToolRegistry::IsReadActionName). */
+	Auto,
+	/** Never refused during PIE. */
+	Read,
+	/** Refused during PIE (e.g. run_python, or a read-looking name that writes). */
+	Write,
+	/** Meant to run during PIE (PIE control, live-PIE reads and writes, Live Coding): never refused. */
+	AllowDuringPie,
+};
+
 /** Metadata describing a registered action */
 struct FMonolithActionInfo
 {
@@ -68,6 +85,9 @@ struct FMonolithActionInfo
 	bool bDestructiveHint = false;
 	bool bIdempotentHint = false;
 	FString Title;
+
+	/** PIE guard policy; see EMonolithPiePolicy. Set with FMonolithToolRegistry::SetActionPiePolicy. */
+	EMonolithPiePolicy PiePolicy = EMonolithPiePolicy::Auto;
 };
 
 /**
@@ -173,8 +193,33 @@ public:
 		bool bIdempotent,
 		const FString& Title);
 
+	/**
+	 * PIE guard. Override how one action is treated while PIE runs (see EMonolithPiePolicy).
+	 * No-op if the action is not registered. Thread-safe: takes RegistryLock.
+	 */
+	void SetActionPiePolicy(const FString& Namespace, const FString& Action, EMonolithPiePolicy Policy);
+
+	/**
+	 * True when an action name reads as a pure read: it starts with get_, list_, find_, search_,
+	 * describe_, export_, render_, query_, read_, validate_, analyze_ and the other prefixes listed
+	 * in the implementation. Everything else counts as a write for the PIE guard.
+	 */
+	static bool IsReadActionName(const FString& Action);
+
+	/** True when the PIE guard refuses this action while PIE runs (allow_during_pie aside). */
+	static bool IsWriteDuringPie(const FMonolithActionInfo& Info);
+
+	/** True while a Play In Editor session is running or starting (or the test override says so). */
+	bool IsPieRunning() const;
+
+	/** Test hook: force IsPieRunning() to a value, or reset with an unset optional. */
+	void SetPieRunningOverride(TOptional<bool> Override);
+
 private:
 	FMonolithToolRegistry() = default;
+
+	/** Test override for IsPieRunning(). */
+	TOptional<bool> PieRunningOverride;
 
 	struct FRegisteredAction
 	{

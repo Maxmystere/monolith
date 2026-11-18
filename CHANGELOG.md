@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Write actions are refused while Play In Editor runs (behaviour change).** Only the Blueprint actor spawns and `load_level` checked for PIE; every other write (`remove_interface`, `compile_blueprint`, `set_cdo_property`, `batch_execute`, `run_python`, ...) ran during PIE, and an editor script run during PIE has crashed the editor. The registry now refuses a write while PIE is running or starting, before its handler runs, with error `-32020` (`ErrPieRunning`, `error.data.pie_running`). Pass the reserved key `allow_during_pie: true` (accepted on every action, removed before the handler) to run it anyway. Reads are never refused: an action counts as a read when it is annotated read-only or its name starts with `get_`, `list_`, `find_`, `search_`, `describe_`, `export_`, `render_`, `query_`, `validate_`, `analyze_`, `capture_`, `preview_` and similar verbs; everything else is a write. Actions meant for PIE are exempt: PIE control and live-PIE access (`start_pie`, `stop_pie`, `run_pie_smoke`, `stop_pie_smoke`, `pie_*`, `run_console_command`, `sample_pie_timeseries`), Live Coding (`trigger_build`, `live_compile`), `load_level` (which tears PIE down itself) and the `ai runtime_*` actions. `run_python` always counts as a write. Only the outermost call is checked, so an allowed batch can dispatch its own writes. Modules set an action's policy with `FMonolithToolRegistry::SetActionPiePolicy` (`Read`, `Write`, `AllowDuringPie`).
+
 ## [0.24.0] - 2026-10-18
 
 > **Action count is approximate.** **~1,400+ actions across 26 in-tree namespaces** — query `monolith_discover()` for the live figure.

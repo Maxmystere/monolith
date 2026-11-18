@@ -127,7 +127,15 @@ void FMonolithFooModule::StartupModule()
 }
 ```
 
-### 4. Update the skill
+### 4. Check the PIE policy
+
+The registry refuses writes while Play In Editor runs (error `-32020`, unless the call passes `allow_during_pie: true`). An action counts as a read when its name starts with a read verb (`get_`, `list_`, `find_`, `search_`, `validate_`, ... — see `FMonolithToolRegistry::IsReadActionName`); everything else counts as a write. If your action is meant to run during PIE, or its name reads as a read but it writes, set its policy after registering it:
+
+```cpp
+Registry.SetActionPiePolicy(TEXT("foo"), TEXT("my_action"), EMonolithPiePolicy::AllowDuringPie); // or Read / Write
+```
+
+### 5. Update the skill
 
 If your domain has a skill in `Skills/`, add the new action to its action table.
 

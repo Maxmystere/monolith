@@ -90,6 +90,12 @@ public:
 	// codes (e.g., `ErrFeatureGated` if we later distinguish "missing
 	// plugin" from "feature flag off").
 	static constexpr int32 ErrOptionalDepUnavailable = -32010;
+
+	// A write action was refused because Play In Editor is running (registry PIE
+	// guard). The call can be retried after stopping PIE, or with
+	// allow_during_pie: true. Distinct from ErrInvalidParams: the params are fine,
+	// the editor state is not.
+	static constexpr int32 ErrPieRunning = -32020;
 };
 
 /**

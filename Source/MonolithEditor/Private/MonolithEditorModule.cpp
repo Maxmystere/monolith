@@ -101,6 +101,30 @@ void FMonolithEditorModule::StartupModule()
 	// Gap 10: programmatic stat-group counter/cycle readout (#if STATS gated).
 	FMonolithStatActions::RegisterActions(FMonolithToolRegistry::Get());
 
+	// PIE guard (registry): actions meant to run while Play In Editor is up. Everything
+	// else whose name doesn't read as a pure read is refused during PIE unless the call
+	// passes allow_during_pie: true.
+	{
+		FMonolithToolRegistry& Registry = FMonolithToolRegistry::Get();
+		static const TCHAR* PieActions[] = {
+			// PIE control and live-PIE access
+			TEXT("start_pie"), TEXT("stop_pie"), TEXT("run_pie_smoke"), TEXT("stop_pie_smoke"),
+			TEXT("pie_set_control_rotation"), TEXT("pie_inject_input_action"), TEXT("pie_possess_spectator_free"),
+			TEXT("pie_get_object_properties"), TEXT("pie_call_function"), TEXT("run_console_command"),
+			// Live Coding is routinely used with PIE running
+			TEXT("trigger_build"), TEXT("live_compile"),
+			// load_level tears PIE down itself before loading
+			TEXT("load_level"),
+		};
+		for (const TCHAR* Action : PieActions)
+		{
+			Registry.SetActionPiePolicy(TEXT("editor"), Action, EMonolithPiePolicy::AllowDuringPie);
+		}
+		Registry.SetActionPiePolicy(TEXT("animation"), TEXT("sample_pie_timeseries"), EMonolithPiePolicy::AllowDuringPie);
+		// Arbitrary Python can change anything: always a write.
+		Registry.SetActionPiePolicy(TEXT("editor"), TEXT("run_python"), EMonolithPiePolicy::Write);
+	}
+
 	// Register settings detail customization
 	FPropertyEditorModule& PropModule = FModuleManager::LoadModuleChecked<FPropertyEditorModule>("PropertyEditor");
 	PropModule.RegisterCustomClassLayout(
