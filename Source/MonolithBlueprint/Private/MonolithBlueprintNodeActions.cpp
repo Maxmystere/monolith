@@ -26,6 +26,9 @@
 #include "K2Node_MacroInstance.h"
 #include "K2Node_ExecutionSequence.h"
 #include "K2Node_SpawnActorFromClass.h"
+#include "K2Node_AddComponentByClass.h"
+#include "K2Node_ConvertAsset.h"
+#include "Components/ActorComponent.h"
 #include "K2Node_DynamicCast.h"
 #include "K2Node_Timeline.h"
 #include "K2Node_Event.h"
@@ -113,6 +116,19 @@ static const TMap<FString, FNodeAlias>& GetNodeAliases()
 		// (BlueprintPin->DefaultObject->GetName() with no null check, K2Node_SpawnActor.cpp:284)
 		// — an editor-killing EXCEPTION_ACCESS_VIOLATION at 0x18.
 		Aliases.Add(TEXT("spawnactor"),     {TEXT("SpawnActorFromClass"), {}});
+
+		// AddComponentByClass ("Add Component by Class") — the class-driven node, not the plain
+		// AActor::AddComponentByClass call, whose return pin stays a bare ActorComponent.
+		Aliases.Add(TEXT("addcomponentbyclass"),       {TEXT("AddComponentByClass"), {}});
+		Aliases.Add(TEXT("add_component_by_class"),    {TEXT("AddComponentByClass"), {}});
+		Aliases.Add(TEXT("k2node_addcomponentbyclass"), {TEXT("AddComponentByClass"), {}});
+
+		// ConvertAsset ("Resolve Soft Reference" / soft class) — wildcard node typed on first connection.
+		Aliases.Add(TEXT("convertasset"),              {TEXT("ConvertAsset"), {}});
+		Aliases.Add(TEXT("convert_asset"),             {TEXT("ConvertAsset"), {}});
+		Aliases.Add(TEXT("resolvesoftreference"),      {TEXT("ConvertAsset"), {}});
+		Aliases.Add(TEXT("resolve_soft_reference"),    {TEXT("ConvertAsset"), {}});
+		Aliases.Add(TEXT("k2node_convertasset"),       {TEXT("ConvertAsset"), {}});
 
 		// DynamicCast aliases
 		Aliases.Add(TEXT("cast"),           {TEXT("DynamicCast"), {}});
@@ -280,6 +296,49 @@ static UFunction* FindFunctionAcrossLoadedClasses(const TArray<FName>& Candidate
 // a /Script path (already-loaded types via TryFindTypeSlow), and an UNLOADED
 // UserDefinedEnum asset path (LoadObject — TryFindTypeSlow/FindFirstObject only
 // see already-loaded types). Returns nullptr when nothing resolves.
+// Set the Class pin of an "Add Component by Class" node and let the node retype itself.
+// Shared by add_node and resolve_node. An empty ComponentClass leaves the pin unset (the
+// caller may link it instead), so the return pin stays ActorComponent. PinDefaultValueChanged
+// is what the editor's class picker triggers: it rebuilds the class-specific pins and sets
+// the return pin to the chosen class.
+static bool ApplyComponentClass(UK2Node_AddComponentByClass* Node, const FString& ComponentClass, FString& OutError)
+{
+	if (ComponentClass.IsEmpty())
+	{
+		return true;
+	}
+	UEdGraphPin* ClassPin = Node->GetClassPin();
+	if (!ClassPin)
+	{
+		OutError = TEXT("AddComponentByClass node has no Class pin");
+		return false;
+	}
+	FString ResolveError;
+	UObject* Resolved = MonolithBlueprintInternal::ResolveDefaultObjectForPin(ClassPin, ComponentClass, ResolveError);
+	UClass* AsClass = Cast<UClass>(Resolved);
+	if (!AsClass)
+	{
+		OutError = Resolved
+			? FString::Printf(TEXT("component_class '%s' is not a class"), *ComponentClass)
+			: FString::Printf(TEXT("component_class: %s"), *ResolveError);
+		return false;
+	}
+	if (!AsClass->IsChildOf(UActorComponent::StaticClass()))
+	{
+		OutError = FString::Printf(TEXT("component_class '%s' is not an ActorComponent class"), *AsClass->GetPathName());
+		return false;
+	}
+	if (AsClass->HasAnyClassFlags(CLASS_Abstract))
+	{
+		OutError = FString::Printf(TEXT("component_class '%s' is abstract and cannot be added"), *AsClass->GetPathName());
+		return false;
+	}
+	ClassPin->DefaultObject = AsClass;
+	ClassPin->DefaultValue.Reset();
+	Node->PinDefaultValueChanged(ClassPin);
+	return true;
+}
+
 static UEnum* ResolveSwitchEnumType(const FString& EnumType)
 {
 	if (EnumType.IsEmpty())
@@ -706,11 +765,11 @@ bool MonolithBlueprintInternal::HasCustomEventNamed(UBlueprint* BP, FName EventN
 void FMonolithBlueprintNodeActions::RegisterActions(FMonolithToolRegistry& Registry)
 {
 	Registry.RegisterAction(TEXT("blueprint"), TEXT("add_node"),
-		TEXT("Add a new node to a Blueprint graph. Supports CallFunction, VariableGet, VariableSet, CustomEvent, Branch, Sequence, MacroInstance, SpawnActorFromClass, DynamicCast, Self, Return, MakeStruct, BreakStruct, SwitchOnEnum, SwitchOnInt, SwitchOnString, FormatText, MakeArray, Select node types. Also supports shorthand aliases: ForEachLoop, ForLoop, ForLoopWithBreak, DoOnce, FlipFlop, Gate (macro shortcuts), IsValid, Delay, RetriggerableDelay (function shortcuts), make_struct, break_struct, switch_enum, switch_int, switch_string, format_text, make_array, select. ComponentBoundEvent (binds an event entry node to a component's BlueprintAssignable multicast delegate; requires component_name + delegate_property_name), AddDelegate (binds an event to a BlueprintAssignable multicast delegate; \"Bind Event to ...\" node), RemoveDelegate (\"Unbind Event from ...\" — removes one previously bound event), ClearDelegate (\"Unbind all Events from ...\" — clears every bound listener), CallDelegate (\"Call ...\" — broadcasts a BP-resident multicast delegate to all listeners)"),
+		TEXT("Add a new node to a Blueprint graph. Supports CallFunction, VariableGet, VariableSet, CustomEvent, Branch, Sequence, MacroInstance, SpawnActorFromClass, DynamicCast, Self, Return, MakeStruct, BreakStruct, SwitchOnEnum, SwitchOnInt, SwitchOnString, FormatText, MakeArray, Select, AddComponentByClass (\"Add Component by Class\": component_class sets the Class pin and retypes the return pin), ConvertAsset (alias ResolveSoftReference: \"Resolve Soft Reference\" / soft class; wildcard pins typed on first connection) node types. Also supports shorthand aliases: ForEachLoop, ForLoop, ForLoopWithBreak, DoOnce, FlipFlop, Gate (macro shortcuts), IsValid, Delay, RetriggerableDelay (function shortcuts), make_struct, break_struct, switch_enum, switch_int, switch_string, format_text, make_array, select. ComponentBoundEvent (binds an event entry node to a component's BlueprintAssignable multicast delegate; requires component_name + delegate_property_name), AddDelegate (binds an event to a BlueprintAssignable multicast delegate; \"Bind Event to ...\" node), RemoveDelegate (\"Unbind Event from ...\" — removes one previously bound event), ClearDelegate (\"Unbind all Events from ...\" — clears every bound listener), CallDelegate (\"Call ...\" — broadcasts a BP-resident multicast delegate to all listeners)"),
 		FMonolithActionHandler::CreateStatic(&HandleAddNode),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"),       TEXT("Blueprint asset path"))
-			.Required(TEXT("node_type"),         TEXT("string"),  TEXT("Node type: CallFunction (or 'function'/'call'), VariableGet (or 'get'), VariableSet (or 'set'), CustomEvent (or 'event'), Branch (or 'if'), Sequence, MacroInstance (or 'macro'), SpawnActorFromClass (or 'spawn'), DynamicCast (or 'cast'), Self, Return, MakeStruct (or 'make_struct'), BreakStruct (or 'break_struct'), SwitchOnEnum (or 'switch_enum'), SwitchOnInt (or 'switch_int'), SwitchOnString (or 'switch_string'), FormatText (or 'format_text'), MakeArray (or 'make_array'), Select. Shortcuts: ForEachLoop, ForLoop, DoOnce, FlipFlop, Gate, IsValid, Delay, RetriggerableDelay, ComponentBoundEvent, AddDelegate, RemoveDelegate, ClearDelegate, CallDelegate"))
+			.Required(TEXT("node_type"),         TEXT("string"),  TEXT("Node type: CallFunction (or 'function'/'call'), VariableGet (or 'get'), VariableSet (or 'set'), CustomEvent (or 'event'), Branch (or 'if'), Sequence, MacroInstance (or 'macro'), SpawnActorFromClass (or 'spawn'), DynamicCast (or 'cast'), Self, Return, MakeStruct (or 'make_struct'), BreakStruct (or 'break_struct'), SwitchOnEnum (or 'switch_enum'), SwitchOnInt (or 'switch_int'), SwitchOnString (or 'switch_string'), FormatText (or 'format_text'), MakeArray (or 'make_array'), Select, AddComponentByClass (or 'add_component_by_class'), ConvertAsset (or 'ResolveSoftReference' / 'resolve_soft_reference'). Shortcuts: ForEachLoop, ForLoop, DoOnce, FlipFlop, Gate, IsValid, Delay, RetriggerableDelay, ComponentBoundEvent, AddDelegate, RemoveDelegate, ClearDelegate, CallDelegate"))
 			.Optional(TEXT("graph_name"),        TEXT("string"),  TEXT("Graph name (defaults to EventGraph)"))
 			.Optional(TEXT("position"),          TEXT("array"),   TEXT("Node position as [x, y]. If omitted, the node is placed in clear space relative to the graph's existing nodes (first node in an empty graph goes to [0, 0]); the response reports the chosen position and position_source: 'auto'. Pass a position to override."), {TEXT("pos")})
 			.Optional(TEXT("function_name"),     TEXT("string"),  TEXT("Function name for CallFunction nodes (e.g. PrintString)"))
@@ -721,6 +780,7 @@ void FMonolithBlueprintNodeActions::RegisterActions(FMonolithToolRegistry& Regis
 			.OptionalAssetPath(TEXT("macro_blueprint"),   TEXT("Blueprint asset path containing the macro (optional for MacroInstance)"))
 			.Optional(TEXT("cast_class"),        TEXT("string"),  TEXT("Class name for DynamicCast nodes (e.g. 'MyPawn'). Accepts A/U prefix or bare name."))
 			.Optional(TEXT("actor_class"),       TEXT("string"),  TEXT("Actor class name for SpawnActorFromClass nodes"))
+			.Optional(TEXT("component_class"),   TEXT("string"),  TEXT("Component class for AddComponentByClass nodes: a native name ('NiagaraComponent', 'UStaticMeshComponent'), a /Script path, or a Blueprint component class path. Sets the Class pin and retypes the return pin. Omit to leave the pin unset (link it instead)."))
 			.Optional(TEXT("struct_type"),       TEXT("string"),  TEXT("Struct type for MakeStruct/BreakStruct nodes (e.g. 'Vector', 'Transform', 'FHitResult'). Accepts F prefix or bare name."))
 			.Optional(TEXT("enum_type"),         TEXT("string"),  TEXT("Enum type for SwitchOnEnum nodes. Accepts a bare/E-prefixed short name (e.g. 'ECollisionChannel'), a /Script path (e.g. '/Script/Engine.ECollisionChannel'), or a UserDefinedEnum asset path (e.g. '/Game/Enums/EMyEnum.EMyEnum' — loaded on demand). Aliases: enum, enum_path."), {TEXT("enum"), TEXT("enum_path")})
 			.Optional(TEXT("format"),            TEXT("string"),  TEXT("Format string for FormatText nodes (e.g. 'Hello {Name}, you have {Count} items'). Argument pins are auto-created from {ArgName} patterns."))
@@ -848,7 +908,7 @@ void FMonolithBlueprintNodeActions::RegisterActions(FMonolithToolRegistry& Regis
 		TEXT("Dry-run node creation — returns resolved type, class, function, and all pins with types/defaults/direction without modifying any asset. Useful for discovering what pins a node will have before adding it."),
 		FMonolithActionHandler::CreateStatic(&HandleResolveNode),
 		FParamSchemaBuilder()
-			.Required(TEXT("node_type"),              TEXT("string"), TEXT("Node type: CallFunction, VariableGet, VariableSet, Branch, CustomEvent, SwitchOnEnum, ComponentBoundEvent, AddDelegate, RemoveDelegate, ClearDelegate, CallDelegate (same aliases as add_node)"))
+			.Required(TEXT("node_type"),              TEXT("string"), TEXT("Node type: CallFunction, VariableGet, VariableSet, Branch, CustomEvent, SwitchOnEnum, ComponentBoundEvent, AddDelegate, RemoveDelegate, ClearDelegate, CallDelegate, AddComponentByClass, ConvertAsset (same aliases as add_node)"))
 			.Optional(TEXT("function_name"),          TEXT("string"), TEXT("Function name for CallFunction nodes"))
 			.Optional(TEXT("target_class"),           TEXT("string"), TEXT("Class to search for the function (CallFunction) or delegate (AddDelegate / RemoveDelegate / ClearDelegate / CallDelegate). For CallFunction may also be a Blueprint (asset path / '_C' / name) or this Blueprint (via asset_path) for a self / BP-defined function."))
 			.Optional(TEXT("enum_type"),              TEXT("string"), TEXT("Enum type for SwitchOnEnum dry-run. Accepts a bare/E-prefixed short name, a /Script path, or a UserDefinedEnum asset path (loaded on demand). Aliases: enum, enum_path."), {TEXT("enum"), TEXT("enum_path")})
@@ -857,6 +917,7 @@ void FMonolithBlueprintNodeActions::RegisterActions(FMonolithToolRegistry& Regis
 			.Optional(TEXT("reliable"),               TEXT("bool"),   TEXT("Use reliable replication for CustomEvent"))
 			.OptionalAssetPath(TEXT("asset_path"),             TEXT("Blueprint asset path (required for ComponentBoundEvent and AddDelegate / RemoveDelegate / ClearDelegate / CallDelegate self-context dry-runs)"))
 			.Optional(TEXT("component_name"),         TEXT("string"), TEXT("Component variable name for ComponentBoundEvent dry-run"))
+			.Optional(TEXT("component_class"),        TEXT("string"), TEXT("Component class for an AddComponentByClass dry-run (same forms as add_node)"))
 			.Optional(TEXT("delegate_property_name"), TEXT("string"), TEXT("Multicast delegate name for ComponentBoundEvent / AddDelegate / RemoveDelegate / ClearDelegate / CallDelegate dry-run"))
 			.Build());
 
@@ -1358,6 +1419,35 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddNode(const TShared
 
 		NewNode = SpawnNode;
 	}
+	// ---- AddComponentByClass ----
+	else if (NodeType == TEXT("AddComponentByClass"))
+	{
+		UK2Node_AddComponentByClass* AddCompNode = NewObject<UK2Node_AddComponentByClass>(Graph);
+		AddCompNode->NodePosX = PosX;
+		AddCompNode->NodePosY = PosY;
+		Graph->AddNode(AddCompNode, true, false);
+		AddCompNode->AllocateDefaultPins();
+
+		FString ClassError;
+		if (!ApplyComponentClass(AddCompNode, Params->GetStringField(TEXT("component_class")), ClassError))
+		{
+			Graph->RemoveNode(AddCompNode);
+			return FMonolithActionResult::Error(ClassError);
+		}
+		NewNode = AddCompNode;
+	}
+	// ---- ConvertAsset (Resolve Soft Reference) ----
+	else if (NodeType == TEXT("ConvertAsset"))
+	{
+		// Both pins start as wildcards; the node retypes itself when its input is connected
+		// (soft object -> object, soft class -> class, and the reverse), as in the editor.
+		UK2Node_ConvertAsset* ConvertNode = NewObject<UK2Node_ConvertAsset>(Graph);
+		ConvertNode->NodePosX = PosX;
+		ConvertNode->NodePosY = PosY;
+		Graph->AddNode(ConvertNode, true, false);
+		ConvertNode->AllocateDefaultPins();
+		NewNode = ConvertNode;
+	}
 	// ---- DynamicCast ----
 	else if (NodeType == TEXT("DynamicCast"))
 	{
@@ -1759,7 +1849,7 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddNode(const TShared
 		else
 		{
 			return FMonolithActionResult::Error(FString::Printf(
-				TEXT("Unknown node_type '%s'. Supported types: CallFunction, VariableGet, VariableSet, CustomEvent, Branch, Sequence, MacroInstance, SpawnActorFromClass, DynamicCast, Self, Return, MakeStruct, BreakStruct, SwitchOnEnum, SwitchOnInt, SwitchOnString, FormatText, MakeArray, Select, ComponentBoundEvent, AddDelegate, RemoveDelegate, ClearDelegate, CallDelegate. Also accepts any UK2Node_ class name as generic fallback."),
+				TEXT("Unknown node_type '%s'. Supported types: CallFunction, VariableGet, VariableSet, CustomEvent, Branch, Sequence, MacroInstance, SpawnActorFromClass, DynamicCast, Self, Return, MakeStruct, BreakStruct, SwitchOnEnum, SwitchOnInt, SwitchOnString, FormatText, MakeArray, Select, AddComponentByClass, ConvertAsset, ComponentBoundEvent, AddDelegate, RemoveDelegate, ClearDelegate, CallDelegate. Also accepts any UK2Node_ class name as generic fallback."),
 				*NodeType));
 		}
 	}
@@ -3417,6 +3507,24 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleResolveNode(const TSh
 			Node = N;
 		}
 	}
+	else if (NodeType == TEXT("AddComponentByClass"))
+	{
+		UK2Node_AddComponentByClass* N = NewObject<UK2Node_AddComponentByClass>(TempGraph);
+		N->AllocateDefaultPins();
+		FString ClassError;
+		if (!ApplyComponentClass(N, Params->GetStringField(TEXT("component_class")), ClassError))
+		{
+			return FMonolithActionResult::Error(ClassError);
+		}
+		Node = N;
+	}
+	else if (NodeType == TEXT("ConvertAsset"))
+	{
+		UK2Node_ConvertAsset* N = NewObject<UK2Node_ConvertAsset>(TempGraph);
+		N->AllocateDefaultPins();
+		Warnings.Add(TEXT("ConvertAsset pins are wildcards until the input is connected (soft object/class -> object/class, or the reverse)"));
+		Node = N;
+	}
 	else
 	{
 		// Generic fallback — try to find any UK2Node subclass
@@ -3438,7 +3546,7 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleResolveNode(const TSh
 		else
 		{
 			return FMonolithActionResult::Error(FString::Printf(
-				TEXT("Unsupported node_type for resolve_node: '%s'. Supported: CallFunction, VariableGet, VariableSet, Branch, CustomEvent, SwitchOnEnum, Sequence, Self, MacroInstance, Return, ComponentBoundEvent, AddDelegate, RemoveDelegate, ClearDelegate, CallDelegate, or any UK2Node_ class name"), *NodeType));
+				TEXT("Unsupported node_type for resolve_node: '%s'. Supported: CallFunction, VariableGet, VariableSet, Branch, CustomEvent, SwitchOnEnum, Sequence, Self, MacroInstance, Return, ComponentBoundEvent, AddDelegate, RemoveDelegate, ClearDelegate, CallDelegate, AddComponentByClass, ConvertAsset, or any UK2Node_ class name"), *NodeType));
 		}
 	}
 

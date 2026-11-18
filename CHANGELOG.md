@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`blueprint add_node` creates "Add Component by Class" and "Resolve Soft Reference" nodes.** New `node_type` values `AddComponentByClass` (aliases `add_component_by_class`, `K2Node_AddComponentByClass`) and `ConvertAsset` (aliases `ResolveSoftReference`, `resolve_soft_reference`, `K2Node_ConvertAsset`). `AddComponentByClass` takes `component_class` (native name, `/Script` path or Blueprint component class), sets the `Class` pin and lets the node retype its return pin, as the editor's class picker does; an unknown, non-component or abstract class is refused and no node is left behind. `ConvertAsset` starts with wildcard pins and types itself on its first connection (soft object -> object, soft class -> class). Previously `node_type=CallFunction, function_name=AddComponentByClass` gave a plain call whose return pin stayed `ActorComponent`, and the generic fallback left the class unset. `resolve_node` previews both.
+
 ## [0.25.0] - 2026-11-20
 
 > **Action count is approximate.** **~1,500+ actions across 27 in-tree namespaces** - query `monolith_discover()` for the live figure.

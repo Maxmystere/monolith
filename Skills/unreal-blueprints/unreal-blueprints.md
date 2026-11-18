@@ -114,6 +114,8 @@ Also works on: Level Blueprints (map path or `$current`), Widget Blueprints.
 | `Branch` / `Sequence` | — | |
 | `MacroInstance` | `macro_name`, `macro_blueprint`? | `macro` |
 | `SpawnActorFromClass` | `actor_class` | `spawn` |
+| `AddComponentByClass` | `component_class`? | `add_component_by_class`. "Add Component by Class": sets the `Class` pin, return pin typed to that class |
+| `ConvertAsset` | — | `ResolveSoftReference`. Wildcard pins, typed when the input is connected (soft object/class -> object/class) |
 | `DynamicCast` | `cast_class` | `cast` |
 | `Self` / `Return` | — | |
 | `MakeStruct` / `BreakStruct` | `struct_type` | |
