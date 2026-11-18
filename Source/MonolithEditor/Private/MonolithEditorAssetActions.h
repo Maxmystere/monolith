@@ -7,8 +7,8 @@ class FJsonObject;
 
 // Generic asset operations (editor namespace).
 //
-//   duplicate_asset — duplicate any asset (StaticMesh, DataAsset, Texture, ...) through
-//                     IAssetTools::DuplicateAsset. Single form (source_path + dest_path) or
+//   duplicate_asset - duplicate any asset (StaticMesh, DataAsset, Texture, ...) through
+//                     ObjectTools::DuplicateSingleObject. Single form (source_path + dest_path) or
 //                     batch form (pairs). The whole request is validated before anything is
 //                     written: a bad source, an invalid or colliding destination, or a
 //                     destination that already exists without overwrite refuses the request.
