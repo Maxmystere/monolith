@@ -125,6 +125,18 @@ public:
 	FOnIndexingComplete OnComplete;
 
 private:
+	/** One asset queued for the batched deep-index pass. */
+	struct FDeepIndexEntry
+	{
+		FAssetData AssetData;
+		int64 AssetId = 0;
+		TSharedPtr<IMonolithIndexer> Indexer;
+		FString SavedHash;
+
+		/** Delete the asset's old child rows in the transaction that writes the new ones. */
+		bool bReplaceChildRows = false;
+	};
+
 	/** Background indexing task */
 	class FIndexingTask : public FRunnable
 	{
@@ -154,6 +166,12 @@ private:
 
 		/** True when this run continues an interrupted index rather than starting one. */
 		bool bIsResume = false;
+
+		/**
+		 * Non-empty for a stale re-index: the run deep-indexes exactly these assets
+		 * and skips the registry scan, the metadata pass and the post-pass indexers.
+		 */
+		TArray<FDeepIndexEntry> StaleQueue;
 
 	private:
 		UMonolithIndexSubsystem* Owner;
@@ -192,17 +210,28 @@ private:
 	};
 
 	/**
-	 * Shared body of StartFullIndex/ResumeFullIndex.
+	 * Shared body of StartFullIndex/ResumeFullIndex/StartStaleReindex.
 	 * @param bForceReset true wipes the database first; false resumes an
 	 *        interrupted run when the schema and the in-progress marker allow it,
 	 *        and falls back to a wipe when they do not.
+	 * @param StaleQueue  non-empty runs only the batched deep pass over these
+	 *        assets: no wipe, no resume, no completion marker.
 	 */
-	bool StartFullIndexInternal(bool bForceReset);
+	bool StartFullIndexInternal(bool bForceReset, TArray<FDeepIndexEntry> StaleQueue = TArray<FDeepIndexEntry>());
+
+	/**
+	 * Re-index the rows a schema migration stamped MonolithStaleDeepIndexMarker,
+	 * through the full index's batched deep pass (worker thread, memory throttle,
+	 * GC, poison-pill counters) rather than the incremental pass, which loads its
+	 * whole delta in one game-thread call.
+	 * @return true if a run actually started.
+	 */
+	bool StartStaleReindex();
 
 	void OnIndexingFinished(bool bSuccess);
 	void OnAssetRegistryFilesLoaded();
 
-	/** void adapter so StartIncrementalIndex can be deferred onto OnFilesLoaded. */
+	/** Startup catch-up: the incremental delta pass, then any stale re-index. */
 	void OnAssetRegistryFilesLoadedIncremental();
 	void RegisterDefaultIndexers();
 	FString GetDatabasePath() const;

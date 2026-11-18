@@ -312,10 +312,11 @@ bool FMonolithIndexRecoverySchemaMigrationTest::RunTest(const FString& /*Paramet
 	}
 	TestEqual(TEXT("its id is unchanged"), Reloaded->Id, AssetId);
 	TestEqual(TEXT("its class is intact"), Reloaded->AssetClass, FString(TEXT("Blueprint")));
-	// The v3 -> v4 step that follows clears a Blueprint's saved hash on purpose, so the next
-	// incremental index re-indexes it and fills pin_defaults; the row itself survives.
-	TestEqual(TEXT("its saved hash is cleared for the v4 Blueprint re-index"), Reloaded->SavedHash, FString());
-	TestEqual(TEXT("its new checkpoint column defaults to empty"), Reloaded->DeepIndexedHash, FString());
+	TestEqual(TEXT("its saved hash is intact"), Reloaded->SavedHash, FString(ContentHash));
+	// The v3 -> v4 step that follows marks a Blueprint's checkpoint stale on purpose, so
+	// the batched stale re-index fills pin_defaults; the row itself survives.
+	TestEqual(TEXT("its new checkpoint column is marked stale for the v4 Blueprint re-index"),
+		Reloaded->DeepIndexedHash, FString(MonolithStaleDeepIndexMarker));
 	TestEqual(TEXT("its new attempt column defaults to zero"), Reloaded->DeepIndexAttempts, 0);
 	TestEqual(TEXT("its child rows survive"), CountRows(Fixture.Database, TEXT("nodes")), (int64)1);
 
