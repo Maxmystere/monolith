@@ -207,15 +207,18 @@ namespace MonolithBlueprintInternal
 		Obj->SetBoolField(TEXT("is_const"), PinType.bIsConst);
 	}
 
-	inline TSharedPtr<FJsonObject> SerializePin(const UEdGraphPin* Pin)
+	inline TSharedPtr<FJsonObject> SerializePin(const UEdGraphPin* Pin, bool bIncludeType = true)
 	{
 		TSharedPtr<FJsonObject> PinObj = MakeShared<FJsonObject>();
 		PinObj->SetStringField(TEXT("id"), Pin->PinId.ToString());
 		PinObj->SetStringField(TEXT("name"), Pin->PinName.ToString());
 		PinObj->SetStringField(TEXT("direction"),
 			Pin->Direction == EGPD_Input ? TEXT("input") : TEXT("output"));
-		PinObj->SetStringField(TEXT("type"),
-			ContainerPrefix(Pin->PinType) + PinTypeToString(Pin->PinType));
+		if (bIncludeType)
+		{
+			PinObj->SetStringField(TEXT("type"),
+				ContainerPrefix(Pin->PinType) + PinTypeToString(Pin->PinType));
+		}
 		// Only emitted when set, to keep graph dumps compact.
 		if (Pin->PinType.bIsReference)
 		{
@@ -418,7 +421,7 @@ namespace MonolithBlueprintInternal
 	// bSafeTitle: report the class name instead of calling GetNodeTitle(). Use for
 	// generic-fallback nodes — some legacy node classes crash in GetNodeTitle() on
 	// unconfigured state (UK2Node_SpawnActor null-derefs its Blueprint pin's DefaultObject).
-	inline TSharedPtr<FJsonObject> SerializeNode(UEdGraphNode* Node, bool bSafeTitle = false)
+	inline TSharedPtr<FJsonObject> SerializeNode(UEdGraphNode* Node, bool bSafeTitle = false, bool bIncludePinTypes = true)
 	{
 		TSharedPtr<FJsonObject> NObj = MakeShared<FJsonObject>();
 		NObj->SetStringField(TEXT("id"), Node->GetName());
@@ -503,7 +506,7 @@ namespace MonolithBlueprintInternal
 		for (const UEdGraphPin* Pin : Node->Pins)
 		{
 			if (!Pin || Pin->bHidden) continue;
-			PinsArr.Add(MakeShared<FJsonValueObject>(SerializePin(Pin)));
+			PinsArr.Add(MakeShared<FJsonValueObject>(SerializePin(Pin, bIncludePinTypes)));
 		}
 		NObj->SetArrayField(TEXT("pins"), PinsArr);
 

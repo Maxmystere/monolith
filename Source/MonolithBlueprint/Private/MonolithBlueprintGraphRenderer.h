@@ -4,9 +4,6 @@
 
 class UBlueprint;
 class UEdGraph;
-class UEdGraphNode;
-class UEdGraphPin;
-class UEdGraphNode_Comment;
 
 /**
  * Renders a Blueprint graph as compact pseudo-code (blueprint render_graph).
@@ -15,7 +12,7 @@ class UEdGraphNode_Comment;
  *     statement per line. A node with several exec outputs (Branch, Sequence, Switch, loops)
  *     indents each linked output under its label.
  *   - A node reached by more than one exec link is labelled (L1: ...); later visits print
- *     "goto L1 (title)".
+ *     "goto L1 (title)", with "[in: Pin]" when the node has several exec inputs.
  *   - Pure nodes are inlined into the consuming argument (depth cap MaxExprDepth). Reroute knots
  *     are followed, split struct pins are folded back into their parent, and Break Struct,
  *     Get Array Item, Make Array/Map and enum literals render as X.Field, A[i], [...], {k: v},
@@ -46,6 +43,6 @@ public:
 	/** "event_graph", "function", "macro", ... plus the header line for the graph. */
 	static FString DescribeGraph(UBlueprint* Blueprint, UEdGraph* Graph, FString& OutType);
 
-	/** Renders one graph, header included. */
-	static FString RenderGraph(UBlueprint* Blueprint, UEdGraph* Graph, const FOptions& Options);
+	/** Renders one graph, header included. OutType as in DescribeGraph. */
+	static FString RenderGraph(UBlueprint* Blueprint, UEdGraph* Graph, const FOptions& Options, FString& OutType);
 };

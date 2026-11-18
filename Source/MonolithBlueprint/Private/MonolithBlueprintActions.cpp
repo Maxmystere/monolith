@@ -317,7 +317,25 @@ FMonolithActionResult FMonolithBlueprintActions::HandleListGraphs(const TSharedP
 
 namespace MonolithGraphReadDetail
 {
-	/** graph_names -> graphs, or every graph for []. Missing names are reported, not skipped. */
+	/** graph_names as given: an array, or one name as a plain string. False when absent. */
+	static bool ReadGraphNames(const TSharedPtr<FJsonObject>& Params, TArray<TSharedPtr<FJsonValue>>& OutNames)
+	{
+		const TArray<TSharedPtr<FJsonValue>>* Names = nullptr;
+		if (Params->TryGetArrayField(TEXT("graph_names"), Names) && Names)
+		{
+			OutNames = *Names;
+			return true;
+		}
+		FString Single;
+		if (Params->TryGetStringField(TEXT("graph_names"), Single) && !Single.IsEmpty())
+		{
+			OutNames.Add(MakeShared<FJsonValueString>(Single));
+			return true;
+		}
+		return false;
+	}
+
+	/** graph_names -> graphs, or every graph for []. Missing and invalid names are reported, not skipped. */
 	static bool ResolveGraphNames(UBlueprint* BP, const TArray<TSharedPtr<FJsonValue>>& Names, TArray<UEdGraph*>& OutGraphs, FString& OutError)
 	{
 		if (Names.Num() == 0)
@@ -331,7 +349,8 @@ namespace MonolithGraphReadDetail
 			FString Name;
 			if (!Value.IsValid() || !Value->TryGetString(Name) || Name.IsEmpty())
 			{
-				continue;
+				OutError = TEXT("graph_names entries must be non-empty graph names");
+				return false;
 			}
 			if (UEdGraph* Graph = MonolithBlueprintInternal::FindGraphByName(BP, Name))
 			{
@@ -371,26 +390,6 @@ namespace MonolithGraphReadDetail
 			Obj->SetStringField(TEXT("parent_graph"), ParentGraph);
 		}
 	}
-
-	static TSharedPtr<FJsonObject> SerializeNodeForRead(UEdGraphNode* Node, bool bIncludePinTypes)
-	{
-		TSharedPtr<FJsonObject> NodeObj = MonolithBlueprintInternal::SerializeNode(Node);
-		if (!bIncludePinTypes)
-		{
-			const TArray<TSharedPtr<FJsonValue>>* Pins = nullptr;
-			if (NodeObj->TryGetArrayField(TEXT("pins"), Pins) && Pins)
-			{
-				for (const TSharedPtr<FJsonValue>& PinValue : *Pins)
-				{
-					if (const TSharedPtr<FJsonObject> PinObj = PinValue->AsObject())
-					{
-						PinObj->RemoveField(TEXT("type"));
-					}
-				}
-			}
-		}
-		return NodeObj;
-	}
 }
 
 FMonolithActionResult FMonolithBlueprintActions::HandleGetGraphData(const TSharedPtr<FJsonObject>& Params)
@@ -419,13 +418,13 @@ FMonolithActionResult FMonolithBlueprintActions::HandleGetGraphData(const TShare
 	const bool bPaging = Params->HasField(TEXT("max_nodes")) || Params->HasField(TEXT("offset"));
 
 	// Single graph (graph_name, the original shape) or several (graph_names).
-	const TArray<TSharedPtr<FJsonValue>>* GraphNamesArr = nullptr;
-	const bool bMulti = Params->TryGetArrayField(TEXT("graph_names"), GraphNamesArr) && GraphNamesArr;
+	TArray<TSharedPtr<FJsonValue>> GraphNames;
+	const bool bMulti = ReadGraphNames(Params, GraphNames);
 	TArray<UEdGraph*> Graphs;
 	if (bMulti)
 	{
 		FString Error;
-		if (!ResolveGraphNames(BP, *GraphNamesArr, Graphs, Error))
+		if (!ResolveGraphNames(BP, GraphNames, Graphs, Error))
 		{
 			return FMonolithActionResult::Error(Error, FMonolithJsonUtils::ErrInvalidParams);
 		}
@@ -464,7 +463,7 @@ FMonolithActionResult FMonolithBlueprintActions::HandleGetGraphData(const TShare
 				bTruncated = true;
 				continue;
 			}
-			NodesArr.Add(MakeShared<FJsonValueObject>(SerializeNodeForRead(Node, bIncludePinTypes)));
+			NodesArr.Add(MakeShared<FJsonValueObject>(MonolithBlueprintInternal::SerializeNode(Node, /*bSafeTitle=*/false, bIncludePinTypes)));
 			++Returned;
 		}
 
@@ -529,10 +528,10 @@ FMonolithActionResult FMonolithBlueprintActions::HandleRenderGraph(const TShared
 	}
 
 	TArray<UEdGraph*> Graphs;
-	const TArray<TSharedPtr<FJsonValue>>* GraphNamesArr = nullptr;
-	const TArray<TSharedPtr<FJsonValue>> NoNames;
+	TArray<TSharedPtr<FJsonValue>> GraphNames;
+	ReadGraphNames(Params, GraphNames);
 	FString Error;
-	if (!ResolveGraphNames(BP, (Params->TryGetArrayField(TEXT("graph_names"), GraphNamesArr) && GraphNamesArr) ? *GraphNamesArr : NoNames, Graphs, Error))
+	if (!ResolveGraphNames(BP, GraphNames, Graphs, Error))
 	{
 		return FMonolithActionResult::Error(Error, FMonolithJsonUtils::ErrInvalidParams);
 	}
@@ -549,12 +548,10 @@ FMonolithActionResult FMonolithBlueprintActions::HandleRenderGraph(const TShared
 		{
 			break;
 		}
-		const FString Text = FMonolithBlueprintGraphRenderer::RenderGraph(BP, Graph, Options);
-		Sections.Add(Text);
+		FString Type;
+		Sections.Add(FMonolithBlueprintGraphRenderer::RenderGraph(BP, Graph, Options, Type));
 		RenderedNodes += Graph->Nodes.Num();
 
-		FString Type;
-		FMonolithBlueprintGraphRenderer::DescribeGraph(BP, Graph, Type);
 		TSharedPtr<FJsonObject> GraphObj = MakeShared<FJsonObject>();
 		GraphObj->SetStringField(TEXT("name"), Graph->GetName());
 		GraphObj->SetStringField(TEXT("type"), Type);

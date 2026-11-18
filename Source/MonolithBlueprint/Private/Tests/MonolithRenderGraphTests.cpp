@@ -19,7 +19,6 @@
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
 #include "Misc/Guid.h"
-#include "Misc/ScopeExit.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Serialization/JsonSerializer.h"
@@ -183,7 +182,11 @@ bool FMonolithRenderGraphLinesTest::RunTest(const FString& /*Parameters*/)
 	TestTrue(TEXT("orphan text"), SetDefault(F, Orphan, TEXT("InString"), TEXT("orphan")));
 
 	// Disabled node, split struct pin, comment box around the merge point.
-	Find(F, Yes)->SetEnabledState(ENodeEnabledState::Disabled);
+	UEdGraphNode* YesNode = Find(F, Yes);
+	if (TestNotNull(TEXT("Yes node"), YesNode))
+	{
+		YesNode->SetEnabledState(ENodeEnabledState::Disabled);
+	}
 	UEdGraphNode* MoveNode = Find(F, Move);
 	UEdGraphPin* NewLocation = MoveNode ? MoveNode->FindPin(TEXT("NewLocation")) : nullptr;
 	if (TestNotNull(TEXT("NewLocation pin"), NewLocation))
@@ -300,6 +303,22 @@ bool FMonolithRenderGraphReadOptionsTest::RunTest(const FString& /*Parameters*/)
 		const FMonolithActionResult R = Run(TEXT("render_graph"), Params);
 		TestFalse(TEXT("unknown graph name is refused"), R.bSuccess);
 		TestTrue(TEXT("refusal lists available graphs"), R.ErrorMessage.Contains(TEXT("EventGraph")));
+	}
+	{
+		TSharedPtr<FJsonObject> Params = P(F.Path);
+		Params->SetStringField(TEXT("graph_names"), TEXT("EventGraph"));
+		const FMonolithActionResult R = Run(TEXT("render_graph"), Params);
+		if (TestTrue(TEXT("one graph name as a plain string is accepted"), R.bSuccess))
+		{
+			TestEqual(TEXT("only the named graph is rendered"), R.Result->GetArrayField(TEXT("graphs")).Num(), 1);
+		}
+	}
+	{
+		TSharedPtr<FJsonObject> Params = P(F.Path);
+		TArray<TSharedPtr<FJsonValue>> Names;
+		Names.Add(MakeShared<FJsonValueString>(TEXT("")));
+		Params->SetArrayField(TEXT("graph_names"), Names);
+		TestFalse(TEXT("an empty graph name is refused"), Run(TEXT("render_graph"), Params).bSuccess);
 	}
 	return true;
 }
