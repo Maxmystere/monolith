@@ -96,6 +96,10 @@ void FPipelineAdapter::RegisterActions(FMonolithToolRegistry& Registry)
 	Anno.bIdempotentHint  = true;
 	Anno.Title = TEXT("Composer pipelines (PR review, release readiness)");
 	Registry.SetDispatcherAnnotations(TEXT("pipeline"), Anno);
+
+	// Read-only composers whose names don't start with a read verb: reads for the PIE guard.
+	Registry.SetActionPiePolicy(TEXT("pipeline"), TEXT("pr_review"), EMonolithPiePolicy::Read);
+	Registry.SetActionPiePolicy(TEXT("pipeline"), TEXT("release_readiness"), EMonolithPiePolicy::Read);
 }
 
 // ============================================================================

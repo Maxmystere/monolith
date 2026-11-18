@@ -112,6 +112,15 @@ void FMonolithUIModule::StartupModule()
 #if WITH_COMMONUI
     FMonolithCommonUIActions::RegisterAll(Registry);
 
+    // These act on live widget instances in the PIE world: the registry's PIE guard must let them through.
+    for (const TCHAR* Action : {
+        TEXT("push_to_activatable_stack"), TEXT("pop_activatable_stack"), TEXT("force_focus"),
+        TEXT("request_refresh_focus"), TEXT("register_tab"), TEXT("create_button_group"),
+        TEXT("set_input_type_override"), TEXT("hot_reload_styles"), TEXT("show_common_message") })
+    {
+        Registry.SetActionPiePolicy(TEXT("ui"), Action, EMonolithPiePolicy::AllowDuringPie);
+    }
+
     // Phase G — diagnostic action that exposes the style service cache state.
     // Lives here (in the module file) rather than in a per-feature actions
     // file because it has zero dependencies beyond the service singleton, and

@@ -561,17 +561,12 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 	// PIE guard: refuse a write while Play In Editor runs, unless the call opts in with
 	// allow_during_pie. Only the outermost dispatch is checked: a handler that calls
 	// other actions (batch / nested ExecuteAction) was already allowed through.
-	bool bAllowDuringPie = false;
-	{
-		const TSharedPtr<FJsonValue> AllowValue = EffectiveParams->TryGetField(TEXT("allow_during_pie"));
-		if (AllowValue.IsValid())
-		{
-			FString AsString;
-			bAllowDuringPie = AllowValue->TryGetBool(bAllowDuringPie) ? bAllowDuringPie
-				: (AllowValue->TryGetString(AsString) && (AsString.Equals(TEXT("true"), ESearchCase::IgnoreCase) || AsString == TEXT("1")));
-		}
-		EffectiveParams->RemoveField(TEXT("allow_during_pie"));
-	}
+	// true, "true", "1" and a non-zero number opt in: FJsonValue::TryGetBool does the string
+	// and number conversions itself.
+	bool bAllowValue = false;
+	const TSharedPtr<FJsonValue> AllowValue = EffectiveParams->TryGetField(TEXT("allow_during_pie"));
+	const bool bAllowDuringPie = AllowValue.IsValid() && AllowValue->TryGetBool(bAllowValue) && bAllowValue;
+	EffectiveParams->RemoveField(TEXT("allow_during_pie"));
 	static thread_local int32 DispatchDepth = 0;
 	if (DispatchDepth == 0 && !bAllowDuringPie && IsWriteDuringPie(ActionInfo) && IsPieRunning())
 	{
@@ -688,6 +683,10 @@ void FMonolithToolRegistry::SetActionPiePolicy(const FString& Namespace, const F
 	if (FRegisteredAction* RegAction = Actions.Find(MakeKey(Namespace, Action)))
 	{
 		RegAction->Info.PiePolicy = Policy;
+	}
+	else
+	{
+		UE_LOG(LogMonolith, Warning, TEXT("SetActionPiePolicy: action '%s:%s' is not registered; PIE policy not applied"), *Namespace, *Action);
 	}
 }
 

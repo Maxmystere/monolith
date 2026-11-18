@@ -267,6 +267,8 @@ void FMonolithMeshLevelDesignActions::RegisterActions(FMonolithToolRegistry& Reg
 			.Optional(TEXT("match_mode"), TEXT("string"), TEXT("Match mode: exact or contains"), TEXT("exact"))
 			.Optional(TEXT("preview"), TEXT("boolean"), TEXT("If true, report without modifying"), TEXT("false"))
 			.Build());
+	// Reads as a find_ action but swaps meshes on level actors: a write for the PIE guard.
+	Registry.SetActionPiePolicy(TEXT("mesh"), TEXT("find_replace_mesh"), EMonolithPiePolicy::Write);
 
 	Registry.RegisterAction(TEXT("mesh"), TEXT("set_lod_screen_sizes"),
 		TEXT("Set per-LOD screen size thresholds on a static mesh asset. Sizes must be monotonically decreasing."),

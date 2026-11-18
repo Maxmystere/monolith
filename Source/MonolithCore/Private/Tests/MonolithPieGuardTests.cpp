@@ -205,6 +205,14 @@ bool FMonolithPieGuardReadNamesTest::RunTest(const FString& /*Parameters*/)
 	{
 		TestTrue(TEXT("ai runtime_set_bb_value runs during PIE"), Policy == EMonolithPiePolicy::AllowDuringPie);
 	}
+	if (PolicyOf(TEXT("mesh"), TEXT("find_replace_mesh"), Policy))
+	{
+		TestTrue(TEXT("mesh find_replace_mesh is a write despite its find_ prefix"), Policy == EMonolithPiePolicy::Write);
+	}
+	if (PolicyOf(TEXT("describe"), TEXT("action_schema"), Policy))
+	{
+		TestTrue(TEXT("describe action_schema is a read"), Policy == EMonolithPiePolicy::Read);
+	}
 	return true;
 }
 

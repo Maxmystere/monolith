@@ -256,6 +256,10 @@ void FMonolithAINavigationActions::RegisterActions(FMonolithToolRegistry& Regist
 			.Required(TEXT("end"), TEXT("object"), TEXT("Ray end {x, y, z} or [x, y, z]"))
 			.Build());
 
+	// Navmesh queries whose names don't start with a read verb: reads for the PIE guard.
+	Registry.SetActionPiePolicy(TEXT("ai"), TEXT("project_point_to_navigation"), EMonolithPiePolicy::Read);
+	Registry.SetActionPiePolicy(TEXT("ai"), TEXT("navigation_raycast"), EMonolithPiePolicy::Read);
+
 	// 162. configure_nav_agent
 	Registry.RegisterAction(TEXT("ai"), TEXT("configure_nav_agent"),
 		TEXT("Modify a supported nav agent's properties (radius, height, step height)"),

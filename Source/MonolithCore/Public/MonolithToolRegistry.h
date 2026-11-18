@@ -195,7 +195,7 @@ public:
 
 	/**
 	 * PIE guard. Override how one action is treated while PIE runs (see EMonolithPiePolicy).
-	 * No-op if the action is not registered. Thread-safe: takes RegistryLock.
+	 * Logs a warning and changes nothing if the action is not registered. Thread-safe: takes RegistryLock.
 	 */
 	void SetActionPiePolicy(const FString& Namespace, const FString& Action, EMonolithPiePolicy Policy);
 

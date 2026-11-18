@@ -61,6 +61,14 @@ void FMonolithGASModule::StartupModule()
 	FMonolithGASScaffoldActions::RegisterActions(Registry);
 	FMonolithGASUIBindingActions::RegisterActions(Registry);
 
+	// These act on actors in the live PIE world: the registry's PIE guard must let them through.
+	for (const TCHAR* Action : {
+		TEXT("grant_ability"), TEXT("revoke_ability"), TEXT("set_attribute_value"),
+		TEXT("apply_effect"), TEXT("remove_effect") })
+	{
+		Registry.SetActionPiePolicy(TEXT("gas"), Action, EMonolithPiePolicy::AllowDuringPie);
+	}
+
 	// Phase 2 (MCP Ergonomics) — register the gas adapter on the central
 	// FMonolithBulkFillRegistry. The Register() call ALWAYS runs (H5 invariant)
 	// regardless of WITH_GBA so `monolith_discover("gas")` action surface stays

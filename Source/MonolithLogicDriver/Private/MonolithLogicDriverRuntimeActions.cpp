@@ -180,6 +180,15 @@ void FMonolithLogicDriverRuntimeActions::RegisterActions(FMonolithToolRegistry& 
 			.Optional(TEXT("limit"), TEXT("number"), TEXT("Max history entries to return (default: 50)"))
 			.Build());
 
+	// These act on the live PIE world: the registry's PIE guard must let them through.
+	for (const TCHAR* Action : {
+		TEXT("runtime_get_sm_state"), TEXT("runtime_start_sm"), TEXT("runtime_stop_sm"),
+		TEXT("runtime_restart_sm"), TEXT("runtime_switch_state"), TEXT("runtime_evaluate_transitions"),
+		TEXT("runtime_get_state_history") })
+	{
+		Registry.SetActionPiePolicy(TEXT("logicdriver"), Action, EMonolithPiePolicy::AllowDuringPie);
+	}
+
 	UE_LOG(LogMonolithLDRuntime, Log, TEXT("MonolithLogicDriver Runtime: registered 7 actions"));
 }
 

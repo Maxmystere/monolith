@@ -845,6 +845,8 @@ void FMonolithMeshSpatialRegistry::RegisterActions(FMonolithToolRegistry& Regist
 			.Optional(TEXT("avoid_rooms"), TEXT("array"), TEXT("Room IDs to exclude from pathfinding"))
 			.Optional(TEXT("block_id"), TEXT("string"), TEXT("Block to query"), TEXT("default"))
 			.Build());
+	// A query whose name doesn't start with a read verb: a read for the PIE guard.
+	Registry.SetActionPiePolicy(TEXT("mesh"), TEXT("path_between_rooms"), EMonolithPiePolicy::Read);
 
 	// 9. save_block_descriptor
 	Registry.RegisterAction(TEXT("mesh"), TEXT("save_block_descriptor"),

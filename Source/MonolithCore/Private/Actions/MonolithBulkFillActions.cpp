@@ -336,6 +336,10 @@ void FMonolithBulkFillActions::RegisterAll()
 		FMonolithActionHandler::CreateStatic(&HandleDescribeActionSchema),
 		BuildDescribeActionSchemaSchema());
 
+	// Introspection only; the names don't start with a read verb, so tell the PIE guard.
+	Reg.SetActionPiePolicy(TEXT("describe"), TEXT("schema"), EMonolithPiePolicy::Read);
+	Reg.SetActionPiePolicy(TEXT("describe"), TEXT("action_schema"), EMonolithPiePolicy::Read);
+
 	UE_LOG(LogMonolith, Log, TEXT("MonolithBulkFillActions: registered 2 namespaces (bulk_fill + describe) with 5 actions total"));
 }
 

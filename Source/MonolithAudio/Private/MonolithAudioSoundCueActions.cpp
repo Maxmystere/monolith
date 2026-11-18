@@ -932,6 +932,8 @@ void FMonolithAudioSoundCueActions::RegisterActions(FMonolithToolRegistry& Regis
 		TEXT("Stop any currently playing preview sound"),
 		FMonolithActionHandler::CreateStatic(&FMonolithAudioSoundCueActions::StopPreview),
 		FParamSchemaBuilder().Build());
+	// preview_sound runs during PIE (read verb), so its stop must too.
+	Registry.SetActionPiePolicy(TEXT("audio"), TEXT("stop_preview"), EMonolithPiePolicy::AllowDuringPie);
 
 	Registry.RegisterAction(TEXT("audio"), TEXT("get_sound_cue_duration"),
 		TEXT("Get the cached duration of a Sound Cue"),

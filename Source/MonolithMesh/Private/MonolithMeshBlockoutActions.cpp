@@ -472,6 +472,9 @@ void FMonolithMeshBlockoutActions::RegisterActions(FMonolithToolRegistry& Regist
 			.Optional(TEXT("tolerance_pct"), TEXT("number"), TEXT("Size match tolerance percentage"), TEXT("20"))
 			.Optional(TEXT("top_n"), TEXT("integer"), TEXT("Top matches per primitive"), TEXT("3"))
 			.Build());
+	// Catalog lookups whose names don't start with a read verb: reads for the PIE guard.
+	Registry.SetActionPiePolicy(TEXT("mesh"), TEXT("match_asset_to_blockout"), EMonolithPiePolicy::Read);
+	Registry.SetActionPiePolicy(TEXT("mesh"), TEXT("match_all_in_volume"), EMonolithPiePolicy::Read);
 
 	// 9. apply_replacement
 	Registry.RegisterAction(TEXT("mesh"), TEXT("apply_replacement"),
