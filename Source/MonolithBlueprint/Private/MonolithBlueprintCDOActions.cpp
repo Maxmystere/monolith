@@ -330,6 +330,11 @@ FMonolithActionResult FMonolithBlueprintCDOActions::HandleGetCDOProperties(const
 				const FString Asked = Original ? *Original : Pair.Key;
 				Missing.Add(MakeShared<FJsonValueString>(Asked));
 
+				// A name the class does have was hidden by another filter: not a typo.
+				if (TargetClass->FindPropertyByName(FName(*Asked, FNAME_Find)))
+				{
+					continue;
+				}
 				const TArray<FString> Close = MonolithNameSuggest::ClosestPropertyNames(TargetClass, Asked);
 				if (Close.Num() > 0)
 				{

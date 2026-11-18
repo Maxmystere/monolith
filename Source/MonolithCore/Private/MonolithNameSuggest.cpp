@@ -2,6 +2,7 @@
 #include "MonolithNameSuggest.h"
 
 #include "Algo/LevenshteinDistance.h"
+#include "Reflection/MonolithReflectionWalker.h"
 #include "UObject/Class.h"
 #include "UObject/UnrealType.h"
 
@@ -72,9 +73,15 @@ namespace MonolithNameSuggest
 		TArray<FString> Names;
 		if (Struct)
 		{
+			// Deprecated storage is never offered: the engine no longer reads it, and the
+			// walker and set_cdo_property refuse it.
+			FString DeprecatedReason;
 			for (TFieldIterator<FProperty> It(Struct); It; ++It)
 			{
-				Names.Add(It->GetName());
+				if (!FMonolithReflectionWalker::IsDeprecatedProperty(*It, DeprecatedReason))
+				{
+					Names.Add(It->GetName());
+				}
 			}
 		}
 		return Closest(Needle, Names, TopN, MinScore);
