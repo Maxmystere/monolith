@@ -2,6 +2,7 @@
 // FMonolithReflectionWalker implementation. Phase 0 framework primitive.
 
 #include "Reflection/MonolithReflectionWalker.h"
+#include "MonolithNameSuggest.h"
 #include "UObject/TextProperty.h"
 #include "MonolithJsonUtils.h"
 #include "UObject/UnrealType.h"
@@ -296,6 +297,13 @@ FProperty* FMonolithReflectionWalker::FindPropertyForwarding(UStruct* Struct, co
 	return nullptr;
 }
 
+FString FMonolithReflectionWalker::UnknownFieldMessage(const UStruct* Struct, const FString& Name)
+{
+	return FString::Printf(TEXT("unknown field '%s' on %s%s"), *Name,
+		Struct ? *Struct->GetName() : TEXT("<null>"),
+		*MonolithNameSuggest::DidYouMeanSuffix(MonolithNameSuggest::ClosestPropertyNames(Struct, Name)));
+}
+
 bool FMonolithReflectionWalker::IsDeprecatedProperty(const FProperty* Prop, FString& OutReason)
 {
 	OutReason.Reset();
@@ -511,8 +519,7 @@ FMonolithReflectionWalker::FPathResolveResult FMonolithReflectionWalker::Resolve
 			MemberProp = FindPropertyForwarding(CurStruct, Seg.Member);
 			if (!MemberProp)
 			{
-				Result.Error = FString::Printf(TEXT("unknown field '%s' on %s"),
-					*Seg.Member, *CurStruct->GetName());
+				Result.Error = UnknownFieldMessage(CurStruct, Seg.Member);
 				return Result;
 			}
 			// A deprecated member resolves, but addresses storage the engine no longer
@@ -1493,7 +1500,7 @@ void FMonolithReflectionWalker::WriteStruct(FStructProperty* StructProp, void* V
 			if (!InnerProp)
 			{
 				W.bOk = false;
-				W.Reason = FString::Printf(TEXT("unknown field '%s' on %s"), *PairKeyStr, *StructProp->Struct->GetName());
+				W.Reason = UnknownFieldMessage(StructProp->Struct, PairKeyStr);
 				OutReport.FieldWrites.Add(W);
 				++LocalErrors;
 				continue;
@@ -1553,7 +1560,7 @@ FDryRunReport FMonolithReflectionWalker::WriteTree(
 		if (!Prop)
 		{
 			W.bOk = false;
-			W.Reason = FString::Printf(TEXT("unknown field '%s' on %s"), *PairKeyStr, *TopStruct->GetName());
+			W.Reason = UnknownFieldMessage(TopStruct, PairKeyStr);
 			Report.FieldWrites.Add(W);
 			continue;
 		}
@@ -1608,7 +1615,7 @@ FDryRunReport FMonolithReflectionWalker::InspectTree(
 		if (!Prop)
 		{
 			W.bOk = false;
-			W.Reason = FString::Printf(TEXT("unknown field '%s' on %s"), *PairKeyStr, *TopStruct->GetName());
+			W.Reason = UnknownFieldMessage(TopStruct, PairKeyStr);
 			Report.FieldWrites.Add(W);
 			continue;
 		}

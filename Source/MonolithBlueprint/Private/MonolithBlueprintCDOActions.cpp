@@ -3,6 +3,7 @@
 #include "MonolithJsonUtils.h"
 #include "MonolithParamSchema.h"
 #include "MonolithAssetUtils.h"
+#include "MonolithNameSuggest.h"
 #include "MonolithBulkFillRegistry.h"
 #include "MonolithBulkFillTypes.h"
 #include "Reflection/MonolithReflectionWalker.h"
@@ -318,15 +319,34 @@ FMonolithActionResult FMonolithBlueprintCDOActions::HandleGetCDOProperties(const
 		// A name can also be "missing" because another filter (category, owner class,
 		// transient) excluded it; the list only says it was not returned.
 		TArray<TSharedPtr<FJsonValue>> Missing;
+		// For each missing name, the closest property names on the class (only names that
+		// are close enough): a typo comes back with what was probably meant.
+		TSharedPtr<FJsonObject> Suggestions = MakeShared<FJsonObject>();
 		for (const TPair<FString, bool>& Pair : PropertyNameSet)
 		{
 			if (!Pair.Value)
 			{
 				const FString* Original = PropertyNameOriginal.Find(Pair.Key);
-				Missing.Add(MakeShared<FJsonValueString>(Original ? *Original : Pair.Key));
+				const FString Asked = Original ? *Original : Pair.Key;
+				Missing.Add(MakeShared<FJsonValueString>(Asked));
+
+				const TArray<FString> Close = MonolithNameSuggest::ClosestPropertyNames(TargetClass, Asked);
+				if (Close.Num() > 0)
+				{
+					TArray<TSharedPtr<FJsonValue>> CloseValues;
+					for (const FString& Name : Close)
+					{
+						CloseValues.Add(MakeShared<FJsonValueString>(Name));
+					}
+					Suggestions->SetArrayField(Asked, CloseValues);
+				}
 			}
 		}
 		Root->SetArrayField(TEXT("missing_property_names"), Missing);
+		if (Suggestions->Values.Num() > 0)
+		{
+			Root->SetObjectField(TEXT("property_name_suggestions"), Suggestions);
+		}
 	}
 
 	return FMonolithActionResult::Success(Root);
@@ -397,7 +417,8 @@ FMonolithActionResult FMonolithBlueprintCDOActions::HandleSetCDOProperty(const T
 	if (!Prop)
 	{
 		return FMonolithActionResult::Error(FString::Printf(
-			TEXT("Property '%s' not found on %s"), *PropertyName, *TargetClass->GetName()));
+			TEXT("Property '%s' not found on %s%s"), *PropertyName, *TargetClass->GetName(),
+			*MonolithNameSuggest::DidYouMeanSuffix(MonolithNameSuggest::ClosestPropertyNames(TargetClass, PropertyName))));
 	}
 
 	// Deprecated storage (e.g. UInputMappingContext::Mappings since UE 5.7) is not read
