@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Property paths and JSON trees go through `TInstancedStruct` / `FInstancedStruct`.** `set_property_at_path` stopped at an instanced struct (`Fragments[1].EquipmentMesh` on a `TArray<TInstancedStruct<FItemFragmentBase>>` failed with `unknown field 'EquipmentMesh' on InstancedStruct`). The path walker now continues into the struct the element holds; a path through an empty instance fails with an error that says to write the whole element first (`path 'Fragments[2]'`, value `/Script/Module.StructName(Field=...)`). `set_cdo_properties` and `bulk_fill` accept an instanced struct as a JSON object: `__struct` (the key `get_cdo_properties` already emits) selects or changes the held type, checked against the `TInstancedStruct<T>` base, and the other keys are written into it, so a read -> edit -> write round trip works.
+
+### Fixed
+
+
 ## [0.25.0] - 2026-11-20
 
 > **Action count is approximate.** **~1,500+ actions across 27 in-tree namespaces** - query `monolith_discover()` for the live figure.

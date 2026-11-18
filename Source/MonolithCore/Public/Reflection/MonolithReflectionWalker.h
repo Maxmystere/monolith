@@ -76,6 +76,9 @@ public:
 	 */
 	static bool IsDeprecatedProperty(const FProperty* Prop, FString& OutReason);
 
+	/** True for an FInstancedStruct property (TInstancedStruct<T> reflects as one, with BaseStruct metadata). */
+	static bool IsInstancedStructProperty(const FProperty* Prop);
+
 	/**
 	 * Result of resolving a dotted+bracket property path down to a single leaf.
 	 *
@@ -289,6 +292,7 @@ private:
 	static void WriteObjectRef(FObjectProperty* ObjProp, void* ValuePtr, const TSharedPtr<FJsonValue>& JsonVal, UObject* Container, FBulkFillFieldWrite& OutWrite);
 	static void WriteSoftObjectRef(FSoftObjectProperty* SoftProp, void* ValuePtr, const TSharedPtr<FJsonValue>& JsonVal, FBulkFillFieldWrite& OutWrite);
 	static void WriteEnum(FEnumProperty* EnumProp, void* ValuePtr, const TSharedPtr<FJsonValue>& JsonVal, FBulkFillFieldWrite& OutWrite);
+	static void WriteInstancedStructObject(FStructProperty* StructProp, void* ValuePtr, const TSharedPtr<FJsonValue>& JsonVal, UObject* Owner, const FBulkFillSpec& Spec, FDryRunReport& OutReport, const FString& PathPrefix, FBulkFillFieldWrite& OutWrite);
 
 	// Describe-side helpers — populate clamp metadata + ImportText sample forms.
 	static void PopulateClampMeta(FProperty* Prop, FSchemaDescriptor& OutDesc);
