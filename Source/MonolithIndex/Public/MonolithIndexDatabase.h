@@ -217,6 +217,12 @@ MONOLITHINDEX_API EMonolithDeepIndexQueueDecision MonolithDecideDeepIndexQueueEn
 inline constexpr int32 MonolithMaxDeepIndexAttempts = 2;
 
 /**
+ * `deep_indexed_hash` of a row whose child rows predate the current schema. Never
+ * equal to a real hash, and not empty: an empty checkpoint means "no child rows".
+ */
+inline constexpr const TCHAR* MonolithStaleDeepIndexMarker = TEXT("pre-v4");
+
+/**
  * RAII wrapper around FSQLiteDatabase for the Monolith project index.
  * Creates all tables on first open, provides typed insert/query helpers.
  * Thread-safe for reads; writes should be serialized by the caller.
@@ -330,6 +336,9 @@ public:
 	/** Reset the attempt counter after a successful deep index. */
 	bool ClearDeepIndexAttempts(int64 AssetId);
 
+	/** Rows stamped MonolithStaleDeepIndexMarker. Fills id, path, class, saved hash and attempts only. */
+	TArray<FIndexedAsset> GetAssetsWithStaleDeepIndex();
+
 	/** Paths dropped from the deep queue by the poison-pill rule, oldest first. */
 	TArray<FString> GetSkippedAssetPaths() const;
 
@@ -401,7 +410,7 @@ private:
 	bool ExecuteSQL(const FString& SQL);
 	FSQLiteDatabase* Database = nullptr;
 
-	/** Set by Open(): whether the pin_defaults tables are there to search. */
+	/** Set by Open() and ResetDatabase(): whether the pin_defaults tables are there to search. */
 	bool bHasPinDefaults = false;
 	FString DbPath;
 };

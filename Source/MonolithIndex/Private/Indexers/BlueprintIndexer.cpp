@@ -62,7 +62,9 @@ void FBlueprintIndexer::IndexPinDefaults(UEdGraphNode* Node, UEdGraph* Graph, in
 		}
 		else if (!Pin->DefaultTextValue.IsEmpty())
 		{
-			Value = Pin->DefaultTextValue.ToString();
+			// The source string is what was typed; ToString() follows the active culture.
+			const FString* Source = FTextInspector::GetSourceString(Pin->DefaultTextValue);
+			Value = Source ? *Source : Pin->DefaultTextValue.ToString();
 		}
 		else
 		{

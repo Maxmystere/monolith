@@ -6,11 +6,13 @@
 //   - Monolith.Index.PinDefaults.SearchFindsLiterals
 //       a Blueprint with a literal SocketName on K2_AttachToComponent and a literal string on
 //       PrintString, indexed by FBlueprintIndexer into a temp DB: search finds both, with
-//       asset, graph, node and pin; a pin left at its default is not indexed; the project
-//       search action reports match_kind/graph/node/pin.
+//       asset, graph, node and pin; a pin left at its default is not indexed. The JSON the
+//       project search action builds from those hits (match_kind/graph/node/pin) is not
+//       covered here: the action reads the editor subsystem's database.
 //   - Monolith.Index.PinDefaults.MigrationFromV3
-//       reopening a v3 database stamps v4 and clears the stored hashes of Blueprint-class
-//       assets only, so the next incremental index re-indexes them.
+//       reopening a v3 database stamps the current version and marks the deep-index
+//       checkpoint of Blueprint-class assets stale, so the batched stale re-index (or a
+//       resumed full index) picks them up; saved hashes and poison assets are left alone.
 // =============================================================================
 
 #if WITH_DEV_AUTOMATION_TESTS
@@ -212,7 +214,21 @@ bool FMonolithPinDefaultMigrationTest::RunTest(const FString& /*Parameters*/)
 	Mesh.AssetName = TEXT("SM_MigrationFixture");
 	Mesh.AssetClass = TEXT("StaticMesh");
 	Mesh.SavedHash = TEXT("hash-mesh");
-	TestTrue(TEXT("Assets inserted"), Db.Database.InsertAsset(Blueprint) > 0 && Db.Database.InsertAsset(Mesh) > 0);
+	FIndexedAsset Poison;
+	Poison.PackagePath = TEXT("/Game/Tests/Monolith/BP_MigrationPoisonFixture");
+	Poison.AssetName = TEXT("BP_MigrationPoisonFixture");
+	Poison.AssetClass = TEXT("Blueprint");
+	Poison.SavedHash = TEXT("hash-poison");
+	const int64 BlueprintId = Db.Database.InsertAsset(Blueprint);
+	const int64 PoisonId = Db.Database.InsertAsset(Poison);
+	TestTrue(TEXT("Assets inserted"), BlueprintId > 0 && PoisonId > 0 && Db.Database.InsertAsset(Mesh) > 0);
+
+	// The Blueprint was deep-indexed by an interrupted full index; the poison one hit the attempt limit.
+	TestTrue(TEXT("Checkpoint written"), Db.Database.SetDeepIndexedHash(BlueprintId, TEXT("hash-blueprint")));
+	for (int32 Attempt = 0; Attempt < MonolithMaxDeepIndexAttempts; ++Attempt)
+	{
+		TestTrue(TEXT("Attempt recorded"), Db.Database.BumpDeepIndexAttempts({ PoisonId }));
+	}
 
 	// Rewind to v3 and reopen: the upgrade an existing user gets.
 	TestTrue(TEXT("Rewind to v3"), Db.Database.WriteMeta(TEXT("schema_version"), TEXT("3")));
@@ -222,9 +238,26 @@ bool FMonolithPinDefaultMigrationTest::RunTest(const FString& /*Parameters*/)
 		return false;
 	}
 
-	TestEqual(TEXT("Stamped v4"), Db.Database.ReadMeta(TEXT("schema_version")), FString(TEXT("4")));
-	TestEqual(TEXT("Blueprint hash cleared"),
-		CountRows(Db.Database, TEXT("SELECT COUNT(*) FROM assets WHERE asset_class = 'Blueprint' AND saved_hash = '';")), 1);
+	TestEqual(TEXT("Stamped current"), Db.Database.ReadMeta(TEXT("schema_version")),
+		FString::FromInt(FMonolithIndexDatabase::CurrentSchemaVersion));
+	// Clearing saved hashes would hand every Blueprint to the incremental pass, which
+	// loads its whole delta in one call.
+	TestEqual(TEXT("Saved hashes kept"),
+		CountRows(Db.Database, TEXT("SELECT COUNT(*) FROM assets WHERE saved_hash IN ('hash-blueprint', 'hash-poison');")), 2);
+	// An empty checkpoint reads as "no child rows": a resumed full index would re-index on
+	// top of the old ones. A stale one re-queues the asset and clears them first.
+	const TArray<FIndexedAsset> Stale = Db.Database.GetAssetsWithStaleDeepIndex();
+	if (TestEqual(TEXT("Only the healthy Blueprint is stale"), Stale.Num(), 1))
+	{
+		TestEqual(TEXT("Stale row id"), Stale[0].Id, BlueprintId);
+		TestEqual(TEXT("Stale row keeps its saved hash"), Stale[0].SavedHash, FString(TEXT("hash-blueprint")));
+		TestTrue(TEXT("A resume re-queues the Blueprint"),
+			MonolithDecideDeepIndexQueueEntry(Stale[0].DeepIndexedHash, Stale[0].DeepIndexAttempts, Stale[0].SavedHash)
+				== EMonolithDeepIndexQueueDecision::Queue);
+	}
+	// What a finished deep index writes takes the row out of the stale set.
+	TestTrue(TEXT("Checkpoint written after re-index"), Db.Database.SetDeepIndexedHash(BlueprintId, TEXT("hash-blueprint")));
+	TestEqual(TEXT("Nothing stale after the re-index"), Db.Database.GetAssetsWithStaleDeepIndex().Num(), 0);
 	TestEqual(TEXT("Other asset hashes kept"),
 		CountRows(Db.Database, TEXT("SELECT COUNT(*) FROM assets WHERE asset_class = 'StaticMesh' AND saved_hash = 'hash-mesh';")), 1);
 	TestTrue(TEXT("Pin tables present after migration"), Db.Database.HasPinDefaults());
