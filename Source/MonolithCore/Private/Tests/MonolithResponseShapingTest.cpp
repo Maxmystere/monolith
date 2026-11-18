@@ -15,6 +15,8 @@
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "HAL/PlatformMisc.h"
+#include "MonolithNameSuggest.h"
+#include "Reflection/MonolithReflectionWalker.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
 
@@ -664,6 +666,223 @@ bool FMonolithResponseShapingPathFieldsNoMatchTest::RunTest(const FString& /*Par
 	}
 	TestTrue(TEXT("warning mentions `matched no paths`"), bSawNoMatch);
 	TestTrue(TEXT("warning lists top-level keys incl. uclass"), bSawTopLevelKeys);
+	return true;
+}
+
+// =============================================================================
+// Unknown params: "did you mean", per-call _strict, run_python `code` alias,
+// and closest property names in the reflection walker (the MPC case).
+// =============================================================================
+
+namespace MonolithParamSuggestTestDetail
+{
+	static const TCHAR* Ns = TEXT("monolith_test_params");
+
+	/** Registers `echo` with a required `name` and an optional `count`; reports whether the handler saw `_strict`. */
+	static void RegisterEcho()
+	{
+		TSharedPtr<FJsonObject> Schema = FParamSchemaBuilder()
+			.Required(TEXT("name"), TEXT("string"), TEXT("Required test param."))
+			.Optional(TEXT("count"), TEXT("integer"), TEXT("Optional test param."))
+			.Build();
+		FMonolithToolRegistry::Get().RegisterAction(Ns, TEXT("echo"), TEXT("Test."),
+			FMonolithActionHandler::CreateLambda([](const TSharedPtr<FJsonObject>& Params)
+			{
+				TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+				Result->SetBoolField(TEXT("saw_strict"), Params->HasField(TEXT("_strict")));
+				return FMonolithActionResult::Success(Result);
+			}),
+			Schema);
+	}
+
+	static TArray<FString> Warnings(const FMonolithActionResult& R)
+	{
+		TArray<FString> Out;
+		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+		if (R.bSuccess && R.Result.IsValid() && R.Result->TryGetArrayField(TEXT("warnings"), Arr) && Arr)
+		{
+			for (const TSharedPtr<FJsonValue>& V : *Arr)
+			{
+				Out.Add(V->AsString());
+			}
+		}
+		return Out;
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMonolithParamSuggestUnknownWarningTest,
+	"Monolith.ResponseShaping.ParamSuggest.UnknownParamWarningSuggests",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithParamSuggestUnknownWarningTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MonolithParamSuggestTestDetail;
+	const FString PriorEnv = FPlatformMisc::GetEnvironmentVariable(TEXT("STRICT_PARAMS"));
+	FPlatformMisc::SetEnvironmentVar(TEXT("STRICT_PARAMS"), TEXT(""));
+	ON_SCOPE_EXIT
+	{
+		FPlatformMisc::SetEnvironmentVar(TEXT("STRICT_PARAMS"), *PriorEnv);
+		FMonolithToolRegistry::Get().UnregisterNamespace(Ns);
+	};
+	RegisterEcho();
+
+	TSharedPtr<FJsonObject> P = MakeShared<FJsonObject>();
+	P->SetStringField(TEXT("name"), TEXT("x"));
+	P->SetNumberField(TEXT("cuont"), 3);
+	P->SetNumberField(TEXT("zzzzzz"), 1);
+	const FMonolithActionResult R = FMonolithToolRegistry::Get().ExecuteAction(Ns, TEXT("echo"), P);
+	TestTrue(TEXT("Unknown params stay a soft warning without strict mode"), R.bSuccess);
+
+	const TArray<FString> W = Warnings(R);
+	const bool bSuggested = W.ContainsByPredicate([](const FString& S)
+	{
+		return S.Contains(TEXT("'cuont'")) && S.Contains(TEXT("did you mean 'count'"));
+	});
+	TestTrue(TEXT("Typo warning suggests the closest param"), bSuggested);
+	const bool bNoBogusSuggestion = W.ContainsByPredicate([](const FString& S)
+	{
+		return S.Contains(TEXT("'zzzzzz'")) && !S.Contains(TEXT("did you mean"));
+	});
+	TestTrue(TEXT("An unrelated key gets no suggestion"), bNoBogusSuggestion);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMonolithParamSuggestStrictCallTest,
+	"Monolith.ResponseShaping.ParamSuggest.PerCallStrict",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithParamSuggestStrictCallTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MonolithParamSuggestTestDetail;
+	const FString PriorEnv = FPlatformMisc::GetEnvironmentVariable(TEXT("STRICT_PARAMS"));
+	FPlatformMisc::SetEnvironmentVar(TEXT("STRICT_PARAMS"), TEXT(""));
+	ON_SCOPE_EXIT
+	{
+		FPlatformMisc::SetEnvironmentVar(TEXT("STRICT_PARAMS"), *PriorEnv);
+		FMonolithToolRegistry::Get().UnregisterNamespace(Ns);
+	};
+	RegisterEcho();
+
+	{
+		TSharedPtr<FJsonObject> P = MakeShared<FJsonObject>();
+		P->SetStringField(TEXT("name"), TEXT("x"));
+		P->SetNumberField(TEXT("cuont"), 3);
+		P->SetBoolField(TEXT("_strict"), true);
+		const FMonolithActionResult R = FMonolithToolRegistry::Get().ExecuteAction(Ns, TEXT("echo"), P);
+		TestFalse(TEXT("_strict: true turns an unknown param into an error"), R.bSuccess);
+		TestEqual(TEXT("Strict rejection is invalid params"), R.ErrorCode, FMonolithJsonUtils::ErrInvalidParams);
+		TestTrue(TEXT("Strict error names the source"), R.ErrorMessage.StartsWith(TEXT("_strict")));
+		TestTrue(TEXT("Strict error suggests the closest param"), R.ErrorMessage.Contains(TEXT("cuont (did you mean 'count'?)")));
+		TestTrue(TEXT("Strict error carries unknown_params data"), R.ErrorData.IsValid());
+	}
+	{
+		// A clean call with _strict runs, and the handler never sees the reserved key.
+		TSharedPtr<FJsonObject> P = MakeShared<FJsonObject>();
+		P->SetStringField(TEXT("name"), TEXT("x"));
+		P->SetStringField(TEXT("_strict"), TEXT("true"));
+		const FMonolithActionResult R = FMonolithToolRegistry::Get().ExecuteAction(Ns, TEXT("echo"), P);
+		TestTrue(TEXT("_strict on a clean call runs"), R.bSuccess);
+		if (R.bSuccess)
+		{
+			TestFalse(TEXT("_strict is removed before the handler"), R.Result->GetBoolField(TEXT("saw_strict")));
+		}
+	}
+	{
+		// _strict: false keeps the soft warning.
+		TSharedPtr<FJsonObject> P = MakeShared<FJsonObject>();
+		P->SetStringField(TEXT("name"), TEXT("x"));
+		P->SetNumberField(TEXT("cuont"), 3);
+		P->SetBoolField(TEXT("_strict"), false);
+		TestTrue(TEXT("_strict: false keeps the soft warning"), FMonolithToolRegistry::Get().ExecuteAction(Ns, TEXT("echo"), P).bSuccess);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMonolithParamSuggestMissingRequiredTest,
+	"Monolith.ResponseShaping.ParamSuggest.MissingRequiredLinksUnknownKey",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithParamSuggestMissingRequiredTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MonolithParamSuggestTestDetail;
+	ON_SCOPE_EXIT { FMonolithToolRegistry::Get().UnregisterNamespace(Ns); };
+	RegisterEcho();
+
+	{
+		// Close name: 'nmae' for 'name'.
+		TSharedPtr<FJsonObject> P = MakeShared<FJsonObject>();
+		P->SetStringField(TEXT("nmae"), TEXT("x"));
+		const FMonolithActionResult R = FMonolithToolRegistry::Get().ExecuteAction(Ns, TEXT("echo"), P);
+		TestFalse(TEXT("Missing required param fails"), R.bSuccess);
+		TestEqual(TEXT("Missing required is invalid params"), R.ErrorCode, FMonolithJsonUtils::ErrInvalidParams);
+		TestTrue(TEXT("Error links the typo to the missing param"), R.ErrorMessage.Contains(TEXT("Did you mean to pass 'nmae' as 'name'?")));
+	}
+	{
+		// Not close, but the only unknown key and the only missing param: 'label' for 'name'.
+		TSharedPtr<FJsonObject> P = MakeShared<FJsonObject>();
+		P->SetStringField(TEXT("label"), TEXT("x"));
+		const FMonolithActionResult R = FMonolithToolRegistry::Get().ExecuteAction(Ns, TEXT("echo"), P);
+		TestTrue(TEXT("A lone unknown key is linked to the lone missing param"), R.ErrorMessage.Contains(TEXT("'label' as 'name'")));
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMonolithParamSuggestRunPythonCodeAliasTest,
+	"Monolith.ResponseShaping.ParamSuggest.RunPythonCodeAlias",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithParamSuggestRunPythonCodeAliasTest::RunTest(const FString& /*Parameters*/)
+{
+	FMonolithToolRegistry& Registry = FMonolithToolRegistry::Get();
+	if (!Registry.HasAction(TEXT("editor"), TEXT("run_python")))
+	{
+		AddInfo(TEXT("editor:run_python is not registered in this session; skipping"));
+		return true;
+	}
+	{
+		TSharedPtr<FJsonObject> P = MakeShared<FJsonObject>();
+		P->SetStringField(TEXT("code"), TEXT("x = 1 + 1"));
+		const FMonolithActionResult R = Registry.ExecuteAction(TEXT("editor"), TEXT("run_python"), P);
+		TestTrue(FString::Printf(TEXT("run_python accepts 'code' (%s)"), *R.ErrorMessage), R.bSuccess);
+	}
+	{
+		TSharedPtr<FJsonObject> P = MakeShared<FJsonObject>();
+		P->SetStringField(TEXT("code"), TEXT("x = 1"));
+		P->SetStringField(TEXT("command"), TEXT("x = 2"));
+		const FMonolithActionResult R = Registry.ExecuteAction(TEXT("editor"), TEXT("run_python"), P);
+		TestFalse(TEXT("'code' and 'command' together is the alias collision error"), R.bSuccess);
+		TestTrue(TEXT("Collision error names both"), R.ErrorMessage.Contains(TEXT("collision")) && R.ErrorMessage.Contains(TEXT("code")));
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMonolithParamSuggestPropertyNamesTest,
+	"Monolith.ResponseShaping.ParamSuggest.PropertyNames",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithParamSuggestPropertyNamesTest::RunTest(const FString& /*Parameters*/)
+{
+	TestTrue(TEXT("Containment counts as close"), MonolithNameSuggest::Similarity(TEXT("Mesh"), TEXT("StaticMesh")) >= 0.6f);
+	TestEqual(TEXT("Closest is case-insensitive and skips exact matches"),
+		FString::Join(MonolithNameSuggest::Closest(TEXT("count"), { TEXT("Count"), TEXT("counter"), TEXT("zebra") }), TEXT(",")),
+		FString(TEXT("counter")));
+	TestEqual(TEXT("Empty suffix without names"), MonolithNameSuggest::DidYouMeanSuffix({}), FString());
+	TestEqual(TEXT("Suffix with two names"), MonolithNameSuggest::DidYouMeanSuffix({ TEXT("A"), TEXT("B") }),
+		FString(TEXT(" — did you mean 'A' or 'B'?")));
+
+	// The 2026-11-18 case: a MaterialParameterCollection read with a wrong property name.
+	const UClass* MpcClass = FindObject<UClass>(nullptr, TEXT("/Script/Engine.MaterialParameterCollection"));
+	if (TestNotNull(TEXT("MaterialParameterCollection class"), MpcClass))
+	{
+		const FString Message = FMonolithReflectionWalker::UnknownFieldMessage(MpcClass, TEXT("ScalarParams"));
+		TestTrue(FString::Printf(TEXT("Walker suggests ScalarParameters (%s)"), *Message),
+			Message.Contains(TEXT("did you mean 'ScalarParameters'")));
+	}
 	return true;
 }
 
