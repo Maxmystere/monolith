@@ -27,7 +27,7 @@ void FMonolithBlueprintBuildActions::RegisterActions(FMonolithToolRegistry& Regi
 			.Optional(TEXT("graph_name"),   TEXT("string"),  TEXT("Target graph name (defaults to EventGraph)"))
 			.Optional(TEXT("variables"),    TEXT("array"),   TEXT("Array of variable descriptors: [{name, type, default_value?, category?, instance_editable?, blueprint_read_only?, expose_on_spawn?, replicated?, transient?}]"))
 			.Optional(TEXT("components"),   TEXT("array"),   TEXT("Array of component descriptors: [{name, class, parent?}]"))
-			.Optional(TEXT("nodes"),        TEXT("array"),   TEXT("Array of node descriptors: [{id, type, position?, function_name?, target_class?, variable_name?, event_name?, macro_name?, macro_blueprint?, cast_class?, actor_class?, struct_type?, enum_type?, format?, num_entries?}]"))
+			.Optional(TEXT("nodes"),        TEXT("array"),   TEXT("Array of node descriptors: [{id, type, position?, function_name?, target_class?, variable_name?, event_name?, macro_name?, macro_blueprint?, cast_class?, actor_class?, component_class?, struct_type?, enum_type?, format?, num_entries?}]"))
 			.Optional(TEXT("connections"),  TEXT("array"),   TEXT("Array of connection descriptors: [{source, source_pin, target, target_pin}] — source/target use the 'id' from nodes array"))
 			.Optional(TEXT("pin_defaults"), TEXT("array"),   TEXT("Array of pin default descriptors: [{node_id, pin_name, value}] — node_id uses the 'id' from nodes array"))
 			.Optional(TEXT("auto_compile"), TEXT("boolean"), TEXT("Compile the Blueprint after building (default: false)"))
@@ -266,13 +266,14 @@ FMonolithActionResult FMonolithBlueprintBuildActions::HandleBuildBlueprintFromSp
 				}
 
 				// Copy optional node params — position, function_name, target_class, variable_name,
-				// event_name, macro_name, macro_blueprint, cast_class, actor_class, struct_type,
-				// enum_type, format, num_entries
+				// event_name, macro_name, macro_blueprint, cast_class, actor_class, component_class,
+				// struct_type, enum_type, format, num_entries
 				static const TCHAR* NodeParamKeys[] = {
 					TEXT("position"), TEXT("function_name"), TEXT("target_class"),
 					TEXT("variable_name"), TEXT("event_name"), TEXT("macro_name"),
 					TEXT("macro_blueprint"), TEXT("cast_class"), TEXT("actor_class"),
-					TEXT("struct_type"), TEXT("enum_type"), TEXT("format"), TEXT("num_entries")
+					TEXT("component_class"), TEXT("struct_type"), TEXT("enum_type"), TEXT("format"),
+					TEXT("num_entries")
 				};
 
 				for (const TCHAR* Key : NodeParamKeys)

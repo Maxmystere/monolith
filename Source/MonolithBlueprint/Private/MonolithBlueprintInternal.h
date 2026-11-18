@@ -264,27 +264,21 @@ namespace MonolithBlueprintInternal
 	//
 	//  Returns nullptr and populates OutError on any failure. Does not
 	//  mutate the pin.
+	//
+	//  ResolveDefaultObjectForPinType is the same resolution from a pin
+	//  type alone, for callers that validate before the node exists;
+	//  PinPath only labels the error messages.
 	// ============================================================
 
-	inline UObject* ResolveDefaultObjectForPin(UEdGraphPin* Pin, const FString& Value, FString& OutError)
+	inline UObject* ResolveDefaultObjectForPinType(const FEdGraphPinType& PinType, const FString& PinPath, const FString& Value, FString& OutError)
 	{
-		if (!Pin)
-		{
-			OutError = TEXT("ResolveDefaultObjectForPin: null pin");
-			return nullptr;
-		}
-
-		const FString PinPath = FString::Printf(TEXT("%s:%s"),
-			Pin->GetOwningNode() ? *Pin->GetOwningNode()->GetName() : TEXT("?"),
-			*Pin->PinName.ToString());
-
-		const bool bIsClassPin  = (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Class);
-		const bool bIsObjectPin = (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Object);
+		const bool bIsClassPin  = (PinType.PinCategory == UEdGraphSchema_K2::PC_Class);
+		const bool bIsObjectPin = (PinType.PinCategory == UEdGraphSchema_K2::PC_Object);
 
 		if (!bIsClassPin && !bIsObjectPin)
 		{
 			OutError = FString::Printf(TEXT("Pin '%s' is not class- or object-typed (category=%s)"),
-				*PinPath, *Pin->PinType.PinCategory.ToString());
+				*PinPath, *PinType.PinCategory.ToString());
 			return nullptr;
 		}
 
@@ -386,7 +380,7 @@ namespace MonolithBlueprintInternal
 		}
 
 		// Type-constraint enforcement against PinSubCategoryObject (the pin's declared base type).
-		UClass* PinBase = Cast<UClass>(Pin->PinType.PinSubCategoryObject.Get());
+		UClass* PinBase = Cast<UClass>(PinType.PinSubCategoryObject.Get());
 		if (PinBase)
 		{
 			if (bIsClassPin)
@@ -413,6 +407,21 @@ namespace MonolithBlueprintInternal
 		}
 
 		return Resolved;
+	}
+
+	inline UObject* ResolveDefaultObjectForPin(UEdGraphPin* Pin, const FString& Value, FString& OutError)
+	{
+		if (!Pin)
+		{
+			OutError = TEXT("ResolveDefaultObjectForPin: null pin");
+			return nullptr;
+		}
+
+		const FString PinPath = FString::Printf(TEXT("%s:%s"),
+			Pin->GetOwningNode() ? *Pin->GetOwningNode()->GetName() : TEXT("?"),
+			*Pin->PinName.ToString());
+
+		return ResolveDefaultObjectForPinType(Pin->PinType, PinPath, Value, OutError);
 	}
 
 	// bSafeTitle: report the class name instead of calling GetNodeTitle(). Use for

@@ -117,18 +117,22 @@ static const TMap<FString, FNodeAlias>& GetNodeAliases()
 		// — an editor-killing EXCEPTION_ACCESS_VIOLATION at 0x18.
 		Aliases.Add(TEXT("spawnactor"),     {TEXT("SpawnActorFromClass"), {}});
 
-		// AddComponentByClass ("Add Component by Class") — the class-driven node, not the plain
+		// AddComponentByClass ("Add Component by Class") - the class-driven node, not the plain
 		// AActor::AddComponentByClass call, whose return pin stays a bare ActorComponent.
+		// Both raw class spellings are aliased: the generic fallback would create the node
+		// but ignore component_class.
 		Aliases.Add(TEXT("addcomponentbyclass"),       {TEXT("AddComponentByClass"), {}});
 		Aliases.Add(TEXT("add_component_by_class"),    {TEXT("AddComponentByClass"), {}});
 		Aliases.Add(TEXT("k2node_addcomponentbyclass"), {TEXT("AddComponentByClass"), {}});
+		Aliases.Add(TEXT("uk2node_addcomponentbyclass"), {TEXT("AddComponentByClass"), {}});
 
-		// ConvertAsset ("Resolve Soft Reference" / soft class) — wildcard node typed on first connection.
+		// ConvertAsset ("Resolve Soft Reference" / soft class) - wildcard node typed when its Input pin is connected.
 		Aliases.Add(TEXT("convertasset"),              {TEXT("ConvertAsset"), {}});
 		Aliases.Add(TEXT("convert_asset"),             {TEXT("ConvertAsset"), {}});
 		Aliases.Add(TEXT("resolvesoftreference"),      {TEXT("ConvertAsset"), {}});
 		Aliases.Add(TEXT("resolve_soft_reference"),    {TEXT("ConvertAsset"), {}});
 		Aliases.Add(TEXT("k2node_convertasset"),       {TEXT("ConvertAsset"), {}});
+		Aliases.Add(TEXT("uk2node_convertasset"),      {TEXT("ConvertAsset"), {}});
 
 		// DynamicCast aliases
 		Aliases.Add(TEXT("cast"),           {TEXT("DynamicCast"), {}});
@@ -292,53 +296,52 @@ static UFunction* FindFunctionAcrossLoadedClasses(const TArray<FName>& Candidate
 // resolution so the real write (HandleAddNode) and the dry-run preview
 // (HandleResolveNode) can never diverge.
 
-// Resolve the UEnum for a SwitchEnum node. Handles a bare/E-prefixed short name,
-// a /Script path (already-loaded types via TryFindTypeSlow), and an UNLOADED
-// UserDefinedEnum asset path (LoadObject — TryFindTypeSlow/FindFirstObject only
-// see already-loaded types). Returns nullptr when nothing resolves.
-// Set the Class pin of an "Add Component by Class" node and let the node retype itself.
-// Shared by add_node and resolve_node. An empty ComponentClass leaves the pin unset (the
-// caller may link it instead), so the return pin stays ActorComponent. PinDefaultValueChanged
-// is what the editor's class picker triggers: it rebuilds the class-specific pins and sets
-// the return pin to the chosen class.
-static bool ApplyComponentClass(UK2Node_AddComponentByClass* Node, const FString& ComponentClass, FString& OutError)
+// Resolve component_class for an "Add Component by Class" node. Shared by add_node and
+// resolve_node, and run before the node exists so a refused class creates nothing. The class
+// is resolved like a default for the node's Class pin (a class pin based on ActorComponent).
+// An empty ComponentClass is valid and leaves OutClass null: the caller may link the pin
+// instead, and the return pin stays ActorComponent.
+static bool ResolveComponentClass(const FString& ComponentClass, UClass*& OutClass, FString& OutError)
 {
+	OutClass = nullptr;
 	if (ComponentClass.IsEmpty())
 	{
 		return true;
 	}
-	UEdGraphPin* ClassPin = Node->GetClassPin();
-	if (!ClassPin)
-	{
-		OutError = TEXT("AddComponentByClass node has no Class pin");
-		return false;
-	}
+	const FEdGraphPinType ClassPinType(UEdGraphSchema_K2::PC_Class, NAME_None, UActorComponent::StaticClass(),
+		EPinContainerType::None, false, FEdGraphTerminalType());
 	FString ResolveError;
-	UObject* Resolved = MonolithBlueprintInternal::ResolveDefaultObjectForPin(ClassPin, ComponentClass, ResolveError);
-	UClass* AsClass = Cast<UClass>(Resolved);
-	if (!AsClass)
+	UClass* Resolved = Cast<UClass>(MonolithBlueprintInternal::ResolveDefaultObjectForPinType(
+		ClassPinType, TEXT("AddComponentByClass:Class"), ComponentClass, ResolveError));
+	if (!Resolved)
 	{
-		OutError = Resolved
-			? FString::Printf(TEXT("component_class '%s' is not a class"), *ComponentClass)
-			: FString::Printf(TEXT("component_class: %s"), *ResolveError);
+		OutError = FString::Printf(TEXT("component_class: %s"), *ResolveError);
 		return false;
 	}
-	if (!AsClass->IsChildOf(UActorComponent::StaticClass()))
+	// Superseded covers the SKEL_ / REINST_ classes of a Blueprint, which must not be stored on a pin.
+	if (Resolved->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists))
 	{
-		OutError = FString::Printf(TEXT("component_class '%s' is not an ActorComponent class"), *AsClass->GetPathName());
+		OutError = FString::Printf(TEXT("component_class '%s' is abstract, deprecated or superseded and cannot be added"), *Resolved->GetPathName());
 		return false;
 	}
-	if (AsClass->HasAnyClassFlags(CLASS_Abstract))
-	{
-		OutError = FString::Printf(TEXT("component_class '%s' is abstract and cannot be added"), *AsClass->GetPathName());
-		return false;
-	}
-	ClassPin->DefaultObject = AsClass;
-	ClassPin->DefaultValue.Reset();
-	Node->PinDefaultValueChanged(ClassPin);
+	OutClass = Resolved;
 	return true;
 }
 
+// Set the Class pin of an "Add Component by Class" node. PinDefaultValueChanged is what the
+// editor's class picker triggers: it rebuilds the class-specific pins and sets the return pin
+// to the chosen class.
+static void SetComponentClass(UK2Node_AddComponentByClass* Node, UClass* ComponentClass)
+{
+	UEdGraphPin* ClassPin = Node->GetClassPin();
+	ClassPin->DefaultObject = ComponentClass;
+	Node->PinDefaultValueChanged(ClassPin);
+}
+
+// Resolve the UEnum for a SwitchEnum node. Handles a bare/E-prefixed short name,
+// a /Script path (already-loaded types via TryFindTypeSlow), and an UNLOADED
+// UserDefinedEnum asset path (LoadObject — TryFindTypeSlow/FindFirstObject only
+// see already-loaded types). Returns nullptr when nothing resolves.
 static UEnum* ResolveSwitchEnumType(const FString& EnumType)
 {
 	if (EnumType.IsEmpty())
@@ -765,7 +768,7 @@ bool MonolithBlueprintInternal::HasCustomEventNamed(UBlueprint* BP, FName EventN
 void FMonolithBlueprintNodeActions::RegisterActions(FMonolithToolRegistry& Registry)
 {
 	Registry.RegisterAction(TEXT("blueprint"), TEXT("add_node"),
-		TEXT("Add a new node to a Blueprint graph. Supports CallFunction, VariableGet, VariableSet, CustomEvent, Branch, Sequence, MacroInstance, SpawnActorFromClass, DynamicCast, Self, Return, MakeStruct, BreakStruct, SwitchOnEnum, SwitchOnInt, SwitchOnString, FormatText, MakeArray, Select, AddComponentByClass (\"Add Component by Class\": component_class sets the Class pin and retypes the return pin), ConvertAsset (alias ResolveSoftReference: \"Resolve Soft Reference\" / soft class; wildcard pins typed on first connection) node types. Also supports shorthand aliases: ForEachLoop, ForLoop, ForLoopWithBreak, DoOnce, FlipFlop, Gate (macro shortcuts), IsValid, Delay, RetriggerableDelay (function shortcuts), make_struct, break_struct, switch_enum, switch_int, switch_string, format_text, make_array, select. ComponentBoundEvent (binds an event entry node to a component's BlueprintAssignable multicast delegate; requires component_name + delegate_property_name), AddDelegate (binds an event to a BlueprintAssignable multicast delegate; \"Bind Event to ...\" node), RemoveDelegate (\"Unbind Event from ...\" — removes one previously bound event), ClearDelegate (\"Unbind all Events from ...\" — clears every bound listener), CallDelegate (\"Call ...\" — broadcasts a BP-resident multicast delegate to all listeners)"),
+		TEXT("Add a new node to a Blueprint graph. Supports CallFunction, VariableGet, VariableSet, CustomEvent, Branch, Sequence, MacroInstance, SpawnActorFromClass, DynamicCast, Self, Return, MakeStruct, BreakStruct, SwitchOnEnum, SwitchOnInt, SwitchOnString, FormatText, MakeArray, Select, AddComponentByClass (\"Add Component by Class\": component_class sets the Class pin and retypes the return pin), ConvertAsset (alias ResolveSoftReference: \"Resolve Soft Reference\" / soft class; wildcard pins, typed when the Input pin is connected, so connect Input before Output) node types. Also supports shorthand aliases: ForEachLoop, ForLoop, ForLoopWithBreak, DoOnce, FlipFlop, Gate (macro shortcuts), IsValid, Delay, RetriggerableDelay (function shortcuts), make_struct, break_struct, switch_enum, switch_int, switch_string, format_text, make_array, select. ComponentBoundEvent (binds an event entry node to a component's BlueprintAssignable multicast delegate; requires component_name + delegate_property_name), AddDelegate (binds an event to a BlueprintAssignable multicast delegate; \"Bind Event to ...\" node), RemoveDelegate (\"Unbind Event from ...\" — removes one previously bound event), ClearDelegate (\"Unbind all Events from ...\" — clears every bound listener), CallDelegate (\"Call ...\" — broadcasts a BP-resident multicast delegate to all listeners)"),
 		FMonolithActionHandler::CreateStatic(&HandleAddNode),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"),       TEXT("Blueprint asset path"))
@@ -1422,17 +1425,21 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddNode(const TShared
 	// ---- AddComponentByClass ----
 	else if (NodeType == TEXT("AddComponentByClass"))
 	{
+		UClass* ComponentClass = nullptr;
+		FString ClassError;
+		if (!ResolveComponentClass(Params->GetStringField(TEXT("component_class")), ComponentClass, ClassError))
+		{
+			return FMonolithActionResult::Error(ClassError);
+		}
+
 		UK2Node_AddComponentByClass* AddCompNode = NewObject<UK2Node_AddComponentByClass>(Graph);
 		AddCompNode->NodePosX = PosX;
 		AddCompNode->NodePosY = PosY;
 		Graph->AddNode(AddCompNode, true, false);
 		AddCompNode->AllocateDefaultPins();
-
-		FString ClassError;
-		if (!ApplyComponentClass(AddCompNode, Params->GetStringField(TEXT("component_class")), ClassError))
+		if (ComponentClass)
 		{
-			Graph->RemoveNode(AddCompNode);
-			return FMonolithActionResult::Error(ClassError);
+			SetComponentClass(AddCompNode, ComponentClass);
 		}
 		NewNode = AddCompNode;
 	}
@@ -3509,12 +3516,17 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleResolveNode(const TSh
 	}
 	else if (NodeType == TEXT("AddComponentByClass"))
 	{
-		UK2Node_AddComponentByClass* N = NewObject<UK2Node_AddComponentByClass>(TempGraph);
-		N->AllocateDefaultPins();
+		UClass* ComponentClass = nullptr;
 		FString ClassError;
-		if (!ApplyComponentClass(N, Params->GetStringField(TEXT("component_class")), ClassError))
+		if (!ResolveComponentClass(Params->GetStringField(TEXT("component_class")), ComponentClass, ClassError))
 		{
 			return FMonolithActionResult::Error(ClassError);
+		}
+		UK2Node_AddComponentByClass* N = NewObject<UK2Node_AddComponentByClass>(TempGraph);
+		N->AllocateDefaultPins();
+		if (ComponentClass)
+		{
+			SetComponentClass(N, ComponentClass);
 		}
 		Node = N;
 	}
