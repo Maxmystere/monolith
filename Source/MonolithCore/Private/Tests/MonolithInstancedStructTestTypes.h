@@ -30,6 +30,9 @@ struct FMonolithTestMeshFragment : public FMonolithTestFragmentBase
 	TSoftObjectPtr<UStaticMesh> EquipmentMesh;
 
 	UPROPERTY(EditAnywhere, Category = "Test")
+	TObjectPtr<UStaticMesh> PreviewMesh;
+
+	UPROPERTY(EditAnywhere, Category = "Test")
 	FName Socket;
 };
 

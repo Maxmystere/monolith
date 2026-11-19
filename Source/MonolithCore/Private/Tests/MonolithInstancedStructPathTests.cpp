@@ -22,6 +22,9 @@
 //   - Monolith.Core.InstancedStructPaths.SetCdoPropertiesTree
 //       set_cdo_properties (the bulk_fill walker) writes instanced elements from JSON objects
 //       with __struct, refuses a __struct outside the base, and its dry run changes nothing.
+//   - Monolith.Core.InstancedStructPaths.ReadWriteRoundTrip
+//       what get_cdo_properties returns for Fragments (an empty element as {}, a null hard
+//       reference as "None") writes back through set_cdo_properties without errors.
 //
 // The asset lives in an in-memory package and is never saved.
 // =============================================================================
@@ -163,7 +166,7 @@ bool FMonolithInstancedStructWriteNestedTest::RunTest(const FString& /*Parameter
 
 	const FMonolithActionResult Dry = SetAtPath(F, TEXT("Fragments[1].EquipmentMesh"), Cube, /*bDryRun=*/true);
 	TestTrue(FString::Printf(TEXT("Dry run succeeds (%s)"), *Dry.ErrorMessage), Dry.bSuccess);
-	TestTrue(TEXT("Dry run reports ok"), Dry.bSuccess && FirstWriteField(Dry, TEXT("ok")) != TEXT("false"));
+	TestEqual(TEXT("Dry run reports ok"), FirstWriteField(Dry, TEXT("ok")), FString(TEXT("true")));
 	TestTrue(TEXT("Dry run leaves the asset alone"), F.MeshAt(1) && F.MeshAt(1)->EquipmentMesh.IsNull());
 
 	const FMonolithActionResult Real = SetAtPath(F, TEXT("Fragments[1].EquipmentMesh"), Cube, /*bDryRun=*/false);
@@ -284,6 +287,61 @@ bool FMonolithInstancedStructSetCdoPropertiesTest::RunTest(const FString& /*Para
 		}
 	}
 	TestTrue(TEXT("__struct outside the base struct is refused by name"), bReported);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMonolithInstancedStructRoundTripTest,
+	"Monolith.Core.InstancedStructPaths.ReadWriteRoundTrip",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithInstancedStructRoundTripTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MonolithInstancedStructPathTests;
+	FFixture F;
+
+	TSharedPtr<FJsonObject> ReadParams = MakeShared<FJsonObject>();
+	ReadParams->SetStringField(TEXT("asset_path"), F.Path);
+	TArray<TSharedPtr<FJsonValue>> Names;
+	Names.Add(MakeShared<FJsonValueString>(TEXT("Fragments")));
+	ReadParams->SetArrayField(TEXT("property_names"), Names);
+	const FMonolithActionResult Read = Run(TEXT("get_cdo_properties"), ReadParams);
+	if (!TestTrue(FString::Printf(TEXT("get_cdo_properties succeeds (%s)"), *Read.ErrorMessage), Read.bSuccess))
+	{
+		return true;
+	}
+	const TArray<TSharedPtr<FJsonValue>>& Props = Read.Result->GetArrayField(TEXT("properties"));
+	if (!TestEqual(TEXT("One property returned"), Props.Num(), 1))
+	{
+		return true;
+	}
+
+	// Write back exactly what was read: the empty element and the null references included.
+	TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+	Properties->SetField(TEXT("Fragments"), Props[0]->AsObject()->TryGetField(TEXT("value")));
+	for (const bool bDryRun : { true, false })
+	{
+		TSharedPtr<FJsonObject> P = MakeShared<FJsonObject>();
+		P->SetStringField(TEXT("asset_path"), F.Path);
+		P->SetObjectField(TEXT("properties"), Properties);
+		P->SetBoolField(TEXT("dry_run"), bDryRun);
+		const FMonolithActionResult R = Run(TEXT("set_cdo_properties"), P);
+		if (TestTrue(FString::Printf(TEXT("Round trip succeeds (%s)"), *R.ErrorMessage), R.bSuccess))
+		{
+			TestEqual(TEXT("Round trip reports no errors"), static_cast<int32>(R.Result->GetNumberField(TEXT("errors"))), 0);
+		}
+	}
+
+	if (TestEqual(TEXT("Three elements kept"), F.Asset->Fragments.Num(), 3))
+	{
+		const FMonolithTestFragmentBase* First = F.Asset->Fragments[0].GetPtr<FMonolithTestFragmentBase>();
+		TestTrue(TEXT("First element is still the base type, Weight 1"),
+			First && F.Asset->Fragments[0].GetScriptStruct() == FMonolithTestFragmentBase::StaticStruct() && First->Weight == 1);
+		TestTrue(TEXT("Second element is still the mesh fragment, with null references"),
+			F.MeshAt(1) && F.MeshAt(1)->Weight == 2 && F.MeshAt(1)->Socket == FName(TEXT("Hand"))
+			&& F.MeshAt(1)->EquipmentMesh.IsNull() && F.MeshAt(1)->PreviewMesh == nullptr);
+		TestFalse(TEXT("Empty element stays empty"), F.Asset->Fragments[2].IsValid());
+	}
 	return true;
 }
 

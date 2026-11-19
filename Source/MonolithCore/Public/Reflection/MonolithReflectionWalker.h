@@ -170,7 +170,9 @@ public:
 	 * from Container/TopStruct down to a single leaf value pointer.
 	 *
 	 * Path grammar:
-	 *   - "."   descends into an FStructProperty member.
+	 *   - "."   descends into an FStructProperty member. Through an FInstancedStruct /
+	 *           TInstancedStruct<T> it continues into the struct the instance holds
+	 *           (an empty instance is an error).
 	 *   - "[N]" indexes an FArrayProperty (N = integer literal). Out-of-range errors.
 	 *   - "[K]" keys an FMapProperty; K is ImportText'd through the map's KeyProp,
 	 *           so enum names ("Jog"), integers, FName/string keys all resolve.
@@ -292,7 +294,6 @@ private:
 	static void WriteObjectRef(FObjectProperty* ObjProp, void* ValuePtr, const TSharedPtr<FJsonValue>& JsonVal, UObject* Container, FBulkFillFieldWrite& OutWrite);
 	static void WriteSoftObjectRef(FSoftObjectProperty* SoftProp, void* ValuePtr, const TSharedPtr<FJsonValue>& JsonVal, FBulkFillFieldWrite& OutWrite);
 	static void WriteEnum(FEnumProperty* EnumProp, void* ValuePtr, const TSharedPtr<FJsonValue>& JsonVal, FBulkFillFieldWrite& OutWrite);
-	static void WriteInstancedStructObject(FStructProperty* StructProp, void* ValuePtr, const TSharedPtr<FJsonValue>& JsonVal, UObject* Owner, const FBulkFillSpec& Spec, FDryRunReport& OutReport, const FString& PathPrefix, FBulkFillFieldWrite& OutWrite);
 
 	// Describe-side helpers — populate clamp metadata + ImportText sample forms.
 	static void PopulateClampMeta(FProperty* Prop, FSchemaDescriptor& OutDesc);
