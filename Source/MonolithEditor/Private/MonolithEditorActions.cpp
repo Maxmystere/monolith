@@ -838,7 +838,7 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 		TEXT("Execute a Python command, statement, or file via IPythonScriptPlugin::ExecPythonCommandEx. Returns success, stdout/stderr captured by Python, and (for evaluate_statement mode) the evaluated result."),
 		FMonolithActionHandler::CreateStatic(&HandleRunPython),
 		FParamSchemaBuilder()
-			.Required(TEXT("command"), TEXT("string"), TEXT("Python source. May be inline code, a single statement, or a file path with optional space-separated args (when mode=execute_file)."))
+			.Required(TEXT("command"), TEXT("string"), TEXT("Python source. May be inline code, a single statement, or a file path with optional space-separated args (when mode=execute_file). Alias: code."), {TEXT("code")})
 			.Optional(TEXT("mode"), TEXT("string"), TEXT("Execution mode: execute_file (default — multi-statement script or file with args), execute_statement (single stmt, prints result), evaluate_statement (single expr, returns result in 'result')."), TEXT("execute_file"))
 			.Optional(TEXT("unattended"), TEXT("bool"), TEXT("Set GIsRunningUnattendedScript=true to suppress UI dialogs."), TEXT("false"))
 			.Optional(TEXT("file_scope"), TEXT("string"), TEXT("Scope for execute_file when command is a .py path: private (isolated locals/globals — default), public (shared with REPL console). Inline code always runs in the shared console globals."), TEXT("private"))

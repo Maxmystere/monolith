@@ -857,7 +857,7 @@ Execute a Python command, statement, or file via `IPythonScriptPlugin::ExecPytho
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `command` | string | **required** | Python source — inline code, single statement, or a file path with optional space-separated args (when `mode=execute_file`) |
+| `command` | string | **required** | Python source — inline code, single statement, or a file path with optional space-separated args (when `mode=execute_file`). Alias: `code` |
 | `mode` | string | optional | `execute_file` (default), `execute_statement`, or `evaluate_statement` |
 | `unattended` | bool | optional | Set `GIsRunningUnattendedScript=true` to suppress UI dialogs. Default: `false` |
 | `file_scope` | string | optional | Scope for `execute_file`: `private` (isolated, default) or `public` (shared with REPL console). Applies only to a `.py` path; inline code always runs in the shared console globals |

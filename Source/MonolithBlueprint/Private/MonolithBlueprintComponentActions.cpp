@@ -4,6 +4,7 @@
 #include "MonolithJsonUtils.h"
 #include "MonolithParamSchema.h"
 #include "MonolithAssetUtils.h"
+#include "MonolithNameSuggest.h"
 #include "Engine/SimpleConstructionScript.h"
 #include "Engine/SCS_Node.h"
 #include "Engine/SkinnedAsset.h"
@@ -567,7 +568,8 @@ FMonolithActionResult FMonolithBlueprintComponentActions::HandleSetComponentProp
 	if (!Prop)
 	{
 		return FMonolithActionResult::Error(FString::Printf(
-			TEXT("Property '%s' not found on %s"), *PropName, *Template->GetClass()->GetName()));
+			TEXT("Property '%s' not found on %s%s"), *PropName, *Template->GetClass()->GetName(),
+			*MonolithNameSuggest::DidYouMeanSuffix(MonolithNameSuggest::ClosestPropertyNames(Template->GetClass(), PropName))));
 	}
 
 	void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(Template);
