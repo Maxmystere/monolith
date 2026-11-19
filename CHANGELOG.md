@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **MVVM authoring: conditions, panel extensions, viewmodel rename and event argument values (6 `ui` actions, `WITH_MVVM`).** `mvvm_add_condition` / `mvvm_remove_condition` author the conditions `mvvm_get_view` already read (condition path, `operation`, `value` / `max_value`, destination function; refused up front when the "Allow Condition Binding" project setting is off). `mvvm_add_panel_extension` / `mvvm_remove_panel_extension` set up the panel widget extension (an empty panel that creates one entry widget per viewmodel of a list) the way the Viewmodels panel does: slot template, entry widget class and entry viewmodel, defaulting to the entry widget's only viewmodel, since the engine fails the compile without one; a panel with children is refused. `mvvm_rename_viewmodel` renames through the subsystem so bindings, events and conditions follow, after loading the Blueprints that reference the widget so the engine's modal "load referencers?" prompt never blocks the call. `mvvm_set_event_argument` sets one event argument to a path or to a literal value, checked against the pin type before anything changes. `mvvm_get_view` adds `view_extensions` / `view_extension_count` and is annotated read-only. Automation tests `Monolith.UI.MVVM.*`.
+
+### Fixed
+
+- **`ui mvvm_get_view` with `widget` missed bindings whose widget source sits behind a conversion function.** Setting a conversion function moves the source into one of the function's argument pins and clears the binding's source path, so filtering on the source widget dropped the binding. The filter now also matches pin paths, for bindings, events and conditions, and a condition's own condition path.
+- **`ui mvvm_remove_viewmodel` ignored conditions.** A condition reading the viewmodel did not block the removal and was left pointing at a viewmodel that no longer existed. It now counts in the refusal ("used by N binding(s), M event(s) and K condition(s)") and is removed with `remove_bindings=true` (`removed_conditions`).
+- **Refused MVVM writes could leave an empty MVVM view behind.** `mvvm_add_event` with events disabled in the project settings, and `mvvm_add_binding` with a `conversion_argument` the function does not have, were refused only after the view had been created on the Widget Blueprint. Both are now checked first.
+
 ## [0.25.0] - 2026-11-20
 
 > **Action count is approximate.** **~1,500+ actions across 27 in-tree namespaces** - query `monolith_discover()` for the live figure.

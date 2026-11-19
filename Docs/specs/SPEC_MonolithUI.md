@@ -49,7 +49,7 @@
 | **CommonUI subtotal** | **62** | | conditional |
 | **MonolithUI total** | **134** | | full configuration |
 | GAS UI binding aliases | 4 | `MonolithGAS/Private/MonolithGASUIBindingActions.cpp` | `WITH_GBA` — registered cross-namespace into `ui::` |
-| UMG MVVM | 8 | `MVVM/MonolithUIMVVMActions.cpp` | `WITH_MVVM` — 2026-11-19 (#173); not included in the totals above. See § MVVM |
+| UMG MVVM | 14 | `MVVM/MonolithUIMVVMActions.cpp` | `WITH_MVVM` — 2026-11-19 (#173); not included in the totals above. See § MVVM |
 
 Counts re-verified against `RegisterAction(TEXT("ui"), ...)` call sites on 2026-04-26 (Phase L). Phase 2 of the 2026-05-16 UI Gap Audit landed 8 additional actions (4 always-on + 4 CommonUI-gated) bringing the totals to 70 / 55 / 125. Phase 3 of the 2026-05-16 UI Gap Audit landed 4 more (1 always-on `build_menu_from_spec` + 3 CommonUI-gated scaffolders) bringing the totals to 71 / 58 / 129. Phase 3 of the 2026-05-22 UI Blueprint Gap Audit landed 4 more CommonUI-gated actions (`set_widget_navigation_bulk`, `dump_widget_navigation`, `convert_border_to_common`, `reparent_widget_root`) bringing the totals to 71 / 62 / 133. Phase 4 of the 2026-05-22 UI Blueprint Gap Audit (2026-05-23) landed 1 always-on action (`set_widget_is_variable`) bringing the totals to 72 / 62 / 134 (CommonUI subtotal unchanged). Production registration sites only — Tests/ excluded.
 
@@ -163,7 +163,7 @@ Counts re-verified against `RegisterAction(TEXT("ui"), ...)` call sites on 2026-
 
 ## MVVM
 
-**UMG MVVM actions (8 — namespace: "ui", conditional on `WITH_MVVM`; issue #173, requested by @Maxmystere).** Source: `Private/MVVM/MonolithUIMVVMActions.cpp`.
+**UMG MVVM actions (14 — namespace: "ui", conditional on `WITH_MVVM`; issue #173, requested by @Maxmystere).** Source: `Private/MVVM/MonolithUIMVVMActions.cpp`.
 
 ### Gate
 
@@ -173,14 +173,20 @@ Registered only when `WITH_MVVM=1`: the `ModelViewViewModel` ("UMG Viewmodel") p
 
 | Action | Params | Description |
 |--------|--------|-------------|
-| `mvvm_get_view` | `asset_path`, `widget`? | Read-only. Viewmodels, bindings, events, conditions and view `settings` (fields below). |
+| `mvvm_get_view` | `asset_path`, `widget`? | Read-only (annotated). Viewmodels, bindings, events, conditions, view extensions and view `settings` (fields below). |
 | `mvvm_add_viewmodel` | `asset_path`, `viewmodel_class`, `name`?, `creation_type`?, `global_identifier`?, `property_path`?, `compile`? (true) | Add a viewmodel; the class must implement `INotifyFieldValueChanged`. |
-| `mvvm_remove_viewmodel` | `asset_path`, `name`, `remove_bindings`? (false), `compile`? (true) | Refuses while bindings/events use it ("used by N binding(s) and M event(s)") unless `remove_bindings=true`. |
+| `mvvm_remove_viewmodel` | `asset_path`, `name`, `remove_bindings`? (false), `compile`? (true) | Refuses while bindings, events or conditions use it ("used by N binding(s), M event(s) and K condition(s)") unless `remove_bindings=true`, which removes them too (`removed_bindings` / `removed_events` / `removed_conditions`). |
 | `mvvm_add_binding` | `asset_path`, `source`, `destination`, `mode`? (`OneWayToDestination`), `execution_mode`?, `conversion_function`?, `conversion_argument`?, `compile`? (true) | Add a binding, optionally with a forward conversion function. |
 | `mvvm_remove_binding` | `asset_path`, `binding_id`? or `binding_index`?, `compile`? (true) | Remove a binding. |
 | `mvvm_add_event` | `asset_path`, `event`, `destination`, `arguments`? (object: argument name -> path), `compile`? (true) | Widget multicast delegate -> viewmodel/self function. Needs the MVVM project setting "Allow Binding Event". |
 | `mvvm_remove_event` | `asset_path`, `event_name`? or `event_index`?, `compile`? (true) | Remove an event. |
 | `mvvm_set_field_notify` | `asset_path` (any Blueprint), `variable`, `enabled`? (true), `compile`? (true) | Toggle FieldNotify metadata on a Blueprint member variable. |
+| `mvvm_rename_viewmodel` | `asset_path`, `name`, `new_name`, `compile`? (true) | Rename a viewmodel; bindings, events and conditions follow. |
+| `mvvm_set_event_argument` | `asset_path`, `event_name`? or `event_index`?, `argument`, `path`? or `value`?, `compile`? (true) | Set one event argument to a source path or a literal value. |
+| `mvvm_add_condition` | `asset_path`, `condition`, `destination`, `operation`, `value`?, `max_value`?, `compile`? (true) | Call `destination` when the `condition` value passes `operation`. Needs the MVVM project setting "Allow Condition Binding". |
+| `mvvm_remove_condition` | `asset_path`, `condition_index`, `compile`? (true) | Remove a condition. |
+| `mvvm_add_panel_extension` | `asset_path`, `widget`, `entry_widget_class`, `entry_viewmodel`?, `num_designer_preview_entries`?, `compile`? (true) | Add the panel widget extension (one entry widget per viewmodel of a list) to an empty panel. |
+| `mvvm_remove_panel_extension` | `asset_path`, `widget`, `compile`? (true) | Remove a panel widget extension. |
 
 ### Path grammar
 
@@ -191,24 +197,27 @@ All write actions take paths in this form, and `mvvm_get_view` returns every pat
 - Per viewmodel: `name`, `id`, `class`, `creation_type`, `global_identifier`, `property_path`, `resolver_class`, `instanced`, `optional`, `create_setter` / `create_getter`, `expose_instance_in_editor`, `use_as_interface`, `can_rename` / `can_edit` / `can_remove`.
 - Per binding: `index`, `id`, `display_name`, `mode`, `enabled`, `compile`, `override_execution_mode` / `execution_mode`, `source` / `destination` (`kind` viewmodel|widget|self|none, `owner`, `fields`, `field_path`, `path`, `display`, `is_component`, `viewmodel_id`), `conversion_source_to_destination` / `conversion_destination_to_source` (`type`, `name`, `function`, `wrapper_graph`, `pins`: `id`, `names`, `split`, `status`, `uses_path`, `source_path`, `value`), and `messages` (errors / warnings / info from the last compile). With a conversion function the source moves into the conversion pin, so the binding's own `source` reads `valid: false`.
 - Events: `index`, `name`, `display_name`, `enabled`, `compile`, `event`, `destination`, `pins`, `messages`. Conditions: `index`, `name`, `enabled`, `compile`, `condition`, `destination`, `operation`, `value`, `max_value`, `pins`, `messages`.
-- Counts: `viewmodel_count`, `binding_count`, `event_count`, `condition_count` (after the `widget` filter) and `total_binding_count`, `total_event_count`, `total_condition_count` (whole view); `widget_filter` echoes the filter. A `widget` value not in the widget tree is an error listing the valid widget names. `has_view: false` when the Widget Blueprint has no MVVM view yet.
+- View extensions (`view_extensions`): `class`, `widget` and, for the panel widget extension, `entry_widget_class`, `entry_viewmodel_id`, `entry_viewmodel` (name, read from the entry widget's view) and `slot_class`; `properties` holds every reflected property of the extension, so other extension types are readable too.
+- Widget filter: a binding, event or condition matches when the widget is in one of its paths or in a pin path (a conversion function's or event's arguments; with a conversion function the binding's source lives only in a pin). View extensions match on their widget.
+- Counts: `viewmodel_count`, `binding_count`, `event_count`, `condition_count`, `view_extension_count` (after the `widget` filter) and `total_binding_count`, `total_event_count`, `total_condition_count` (whole view); `widget_filter` echoes the filter. A `widget` value not in the widget tree is an error listing the valid widget names. `has_view: false` when the Widget Blueprint has no MVVM view yet.
 
 ### Write
 
-All writes are transacted (`FScopedTransaction`), refused during PIE, mark the Widget Blueprint modified (structurally for viewmodel add/remove) and compile by default (`compile=true`, which also fills binding `messages`). Nothing is saved to disk. Writes go through `UMVVMEditorSubsystem` (`RequestView`, `AddViewModel`, `AddBinding`, `SetBindingTypeForBinding`, `SetSourcePathForBinding`, `SetDestinationPathForBinding`, `SetSourceToDestinationConversionFunction`, `SetPathForConversionFunctionArgument`, `OverrideExecutionModeForBinding`, `AddEvent`, `SetEventPath`, `SetEventDestinationPath`, `SetEventArgumentPath`, `RemoveBinding`, `RemoveEvent`). All inputs (paths, enum names, `IsValidConversionFunction`, `UMVVMBlueprintViewEvent::Supports`) are resolved and validated before the asset is touched, so a rejected call leaves the asset unchanged.
+All writes are transacted (`FScopedTransaction`), refused during PIE, mark the Widget Blueprint modified (structurally for viewmodel add/remove) and compile by default (`compile=true`, which also fills binding `messages`). Nothing is saved to disk. Writes go through `UMVVMEditorSubsystem` (`RequestView`, `AddViewModel`, `AddBinding`, `SetBindingTypeForBinding`, `SetSourcePathForBinding`, `SetDestinationPathForBinding`, `SetSourceToDestinationConversionFunction`, `SetPathForConversionFunctionArgument`, `OverrideExecutionModeForBinding`, `AddEvent`, `SetEventPath`, `SetEventDestinationPath`, `SetEventArgumentPath`, `RemoveBinding`, `RemoveEvent`, `RenameViewModel`, `AddCondition`, `SetConditionPath`, `SetConditionDestinationPath`, `SetConditionOperation*`, `RemoveCondition`). All inputs (paths, enum names, `IsValidConversionFunction`, a named `conversion_argument`, `UMVVMBlueprintViewEvent::Supports`, the "Allow Binding Event" / "Allow Condition Binding" project settings) are resolved and validated before the asset is touched, so a rejected call leaves the asset unchanged and creates no MVVM view.
 
 - **`mvvm_add_viewmodel`.** Custom names are validated with `VerifyViewModelRename` and applied via `UMVVMBlueprintView::RenameViewModel` (not the subsystem rename, which can open a modal "load referencers" dialog). `creation_type` is validated against `UE::MVVM::GetAllowedContextCreationType`; enum names are read by reflection, so the 5.8-only `Context` type works without a version gate. `Resolver` is refused (it needs a resolver instance). **Default creation type:** without `creation_type` the action uses `CreateInstance` when the class allows it, otherwise the engine default (first allowed type); the response's `creation_type_source` is `default` or `explicit`, and `allowed_creation_types` lists the options. This is a Monolith choice: the stock MVVM panel defaults to the first allowed type (`Manual`). Manual contexts (explicit or default) get `optional` + `create_setter`, the values the engine gives Manual contexts on load. The action also sets the context's private `bCreateSetterFunction_Deprecation` flag by reflection: contexts built in memory leave it false, so `FMVVMBlueprintViewModelContext::PostSerialize` would otherwise re-run its old-asset upgrade on the next load or transaction undo/redo and overwrite `optional` / `create_setter`. If the flag cannot be found the response carries a `warning`. The viewmodel in the response is read from the view after the compile.
 - **`mvvm_add_binding`.** Conversion functions are accepted only for modes that write to the destination; the source is assigned to `conversion_argument` (default: the first argument without a path). If the editor rejects the conversion, the new binding is removed again.
+- **`mvvm_rename_viewmodel`.** Checks `CanRename` and `VerifyViewModelRename`, then loads the on-disk Blueprints that reference the Widget Blueprint (asset registry referencers) before calling `UMVVMEditorSubsystem::RenameViewModel`: the subsystem renames the viewmodel in loaded referencers' bindings and otherwise opens a modal "load referencers?" dialog, which would block the call.
+- **`mvvm_set_event_argument`.** `argument` is a pin id as listed in the event's `pins` (`Parent.Child` for a split pin). `path` goes through `SetEventArgumentPath`; `value` is checked with `UEdGraphSchema_K2::IsPinDefaultValid` on the wrapper graph pin, set with `TrySetDefaultValue` and stored with `UMVVMBlueprintViewEvent::SavePinValues`. An unknown argument is an error listing the event's arguments.
+- **`mvvm_add_panel_extension`.** Same setup as the engine's panel extension customization: `UMVVMWidgetBlueprintExtension_View::CreateBlueprintWidgetExtension(UMVVMBlueprintViewExtension_PanelWidget)`, then the private `WidgetName`, `SlotObj` (a new slot of the panel's slot class), `EntryWidgetClass`, `EntryViewModelId` and `NumDesignerPreviewEntries` are written by reflection. Refused when the panel has children (the extension owns the panel's slots; the editor deletes them), when the panel already has a panel extension, and when the entry widget has no matching viewmodel (the engine fails the compile without one; `entry_viewmodel` defaults to the entry widget's only viewmodel). With `compile=true` the response carries `blueprint_status`.
 - **`mvvm_set_field_notify`.** `FBlueprintEditorUtils::SetBlueprintVariableMetaData(..., FBlueprintMetadata::MD_FieldNotify, "")`, or `RemoveFieldNotifyFromAllMetadata` + `RemoveBlueprintVariableMetaData` to clear; requires the Blueprint's parent to implement `INotifyFieldValueChanged`. An unknown variable is an error listing the Blueprint's variables.
 
 ### Not implemented
 
-- Condition authoring: `mvvm_add_condition` / `mvvm_remove_condition` (WISHLIST). The subsystem API exists in 5.7 and 5.8 (`AddCondition` + `SetConditionPath` / `SetConditionDestinationPath` / `SetConditionOperation*`); conditions are read-only today.
-- Panel-widget view extensions (`UMVVMBlueprintViewExtension_PanelWidget`; private fields need reflection) (WISHLIST).
-- Viewmodel rename / reparent after creation (WISHLIST).
+- Viewmodel reparent (class change) after creation (WISHLIST).
 - Backward (destination-to-source) conversion functions (WISHLIST).
 - Split pins on conversion / event arguments (WISHLIST).
-- Setting conversion / event argument default values; only paths can be assigned (WISHLIST).
+- Conversion function argument default values; only paths can be assigned there. Event arguments take literals through `mvvm_set_event_argument` (WISHLIST).
 
 ---
 
