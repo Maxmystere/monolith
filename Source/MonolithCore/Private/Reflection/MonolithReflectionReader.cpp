@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "Reflection/MonolithReflectionReader.h"
+#include "Reflection/MonolithReflectionWalker.h"
 #include "UObject/TextProperty.h"
 #include "UObject/UnrealType.h"
 #include "UObject/Class.h"
@@ -70,8 +71,7 @@ TSharedPtr<FJsonValue> FMonolithReflectionReader::PropertyToJsonValue(FProperty*
 	}
 
 	// TInstancedStruct — unwrap and emit the concrete struct with a __struct tag
-	if (const FStructProperty* InstancedStructProp = CastField<FStructProperty>(Prop);
-		InstancedStructProp && InstancedStructProp->Struct == TBaseStructure<FInstancedStruct>::Get())
+	if (FMonolithReflectionWalker::IsInstancedStructProperty(Prop))
 	{
 		const FInstancedStruct& Instanced = *static_cast<const FInstancedStruct*>(ValuePtr);
 		const UScriptStruct* InnerStruct = Instanced.GetScriptStruct();

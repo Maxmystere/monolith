@@ -303,95 +303,59 @@ bool FMonolithReflectionWalker::IsInstancedStructProperty(const FProperty* Prop)
 	return StructProp && StructProp->Struct == TBaseStructure<FInstancedStruct>::Get();
 }
 
-void FMonolithReflectionWalker::WriteInstancedStructObject(FStructProperty* StructProp, void* ValuePtr, const TSharedPtr<FJsonValue>& JsonVal, UObject* Owner, const FBulkFillSpec& Spec, FDryRunReport& OutReport, const FString& PathPrefix, FBulkFillFieldWrite& OutWrite)
+namespace
 {
-	FInstancedStruct& Instanced = *static_cast<FInstancedStruct*>(ValuePtr);
-	const TSharedPtr<FJsonObject> Obj = JsonVal->AsObject();
-	OutWrite.CurrentValue = Instanced.GetScriptStruct() ? Instanced.GetScriptStruct()->GetPathName() : TEXT("None");
-
-	FString TypeName;
-	if (Obj.IsValid() && Obj->TryGetStringField(TEXT("__struct"), TypeName) && !TypeName.IsEmpty())
+	// Object form of an instanced struct. "__struct" (the key the reflection reader emits)
+	// selects the held type, checked against the TInstancedStruct<T> base; the instance is
+	// re-created when it names a different struct. On success OutStruct / OutPtr address the
+	// held struct for the caller to write the other keys into.
+	bool ResolveInstancedStructTarget(const FStructProperty* StructProp, void* ValuePtr, const FJsonObject& Obj, FBulkFillFieldWrite& OutWrite, UStruct*& OutStruct, void*& OutPtr)
 	{
-		UScriptStruct* Wanted = FindObject<UScriptStruct>(nullptr, *TypeName);
-		if (!Wanted)
+		FInstancedStruct& Instanced = *static_cast<FInstancedStruct*>(ValuePtr);
+		OutWrite.CurrentValue = Instanced.GetScriptStruct() ? Instanced.GetScriptStruct()->GetPathName() : TEXT("None");
+
+		FString TypeName;
+		if (Obj.TryGetStringField(TEXT("__struct"), TypeName) && !TypeName.IsEmpty())
 		{
-			Wanted = LoadObject<UScriptStruct>(nullptr, *TypeName);
-		}
-		if (!Wanted)
-		{
-			OutWrite.bOk = false;
-			OutWrite.Reason = FString::Printf(TEXT("__struct '%s' is not a known struct (use the path form, e.g. /Script/Module.StructName)"), *TypeName);
-			return;
-		}
-		// TInstancedStruct<FBase> declares its base in metadata; refuse a struct outside it.
-		// On TArray<TInstancedStruct<T>> the metadata sits on the container property.
-		FString BaseName = StructProp->GetMetaData(TEXT("BaseStruct"));
-		if (BaseName.IsEmpty())
-		{
-			if (const FProperty* OwnerProp = StructProp->GetOwner<FProperty>())
+			UScriptStruct* Wanted = LoadObject<UScriptStruct>(nullptr, *TypeName);
+			if (!Wanted)
 			{
-				BaseName = OwnerProp->GetMetaData(TEXT("BaseStruct"));
+				OutWrite.bOk = false;
+				OutWrite.Reason = FString::Printf(TEXT("__struct '%s' is not a known struct (use the path form, e.g. /Script/Module.StructName)"), *TypeName);
+				return false;
 			}
-		}
-		if (!BaseName.IsEmpty())
-		{
-			const UScriptStruct* Base = FindObject<UScriptStruct>(nullptr, *BaseName);
-			if (!Base)
+			// TInstancedStruct<FBase> declares its base in metadata; refuse a struct outside it.
+			// On TArray<TInstancedStruct<T>> the metadata sits on the container property.
+			FString BaseName = StructProp->GetMetaData(TEXT("BaseStruct"));
+			if (BaseName.IsEmpty())
 			{
-				Base = UClass::TryFindTypeSlow<UScriptStruct>(BaseName);
+				if (const FProperty* OwnerProp = StructProp->GetOwner<FProperty>())
+				{
+					BaseName = OwnerProp->GetMetaData(TEXT("BaseStruct"));
+				}
 			}
+			const UScriptStruct* Base = UClass::TryFindTypeSlow<UScriptStruct>(BaseName);
 			if (Base && !Wanted->IsChildOf(Base))
 			{
 				OutWrite.bOk = false;
 				OutWrite.Reason = FString::Printf(TEXT("__struct '%s' is not a %s"), *Wanted->GetPathName(), *Base->GetName());
-				return;
+				return false;
+			}
+			if (Instanced.GetScriptStruct() != Wanted)
+			{
+				Instanced.InitializeAs(Wanted);
 			}
 		}
-		if (Instanced.GetScriptStruct() != Wanted)
-		{
-			Instanced.InitializeAs(Wanted);
-		}
-	}
 
-	const UScriptStruct* HeldStruct = Instanced.GetScriptStruct();
-	uint8* HeldMemory = Instanced.GetMutableMemory();
-	if (!HeldStruct || !HeldMemory)
-	{
-		OutWrite.bOk = false;
-		OutWrite.Reason = TEXT("instanced struct is empty: give \"__struct\" (e.g. /Script/Module.StructName) or write the element as '/Script/Module.StructName(Field=...)'");
-		return;
-	}
-
-	int32 FieldCount = 0;
-	int32 LocalErrors = 0;
-	for (const auto& Pair : Obj->Values)
-	{
-		const FString Key = MonolithKeyToString(Pair.Key);
-		if (Key == TEXT("__struct"))
+		if (!Instanced.IsValid())
 		{
-			continue;
+			OutWrite.bOk = false;
+			OutWrite.Reason = TEXT("instanced struct is empty: give \"__struct\" (e.g. /Script/Module.StructName) or write the element as '/Script/Module.StructName(Field=...)'");
+			return false;
 		}
-		++FieldCount;
-		FBulkFillFieldWrite W;
-		W.Path = FString::Printf(TEXT("%s.%s"), *PathPrefix, *Key);
-		FProperty* InnerProp = FindPropertyForwarding(const_cast<UScriptStruct*>(HeldStruct), Key);
-		if (!InnerProp)
-		{
-			W.bOk = false;
-			W.Reason = FString::Printf(TEXT("unknown field '%s' on %s"), *Key, *HeldStruct->GetName());
-			OutReport.FieldWrites.Add(W);
-			++LocalErrors;
-			continue;
-		}
-		DispatchByPropertyType(InnerProp, InnerProp->ContainerPtrToValuePtr<void>(HeldMemory), Pair.Value, Owner, Spec, OutReport, W.Path, W);
-		if (!W.bOk) { ++LocalErrors; }
-		OutReport.FieldWrites.Add(W);
-	}
-	OutWrite.bOk = (LocalErrors == 0);
-	OutWrite.ProposedValue = FString::Printf(TEXT("%s {%d fields}"), *HeldStruct->GetPathName(), FieldCount);
-	if (!OutWrite.bOk)
-	{
-		OutWrite.Reason = FString::Printf(TEXT("%d nested write(s) failed"), LocalErrors);
+		OutStruct = const_cast<UScriptStruct*>(Instanced.GetScriptStruct());
+		OutPtr = Instanced.GetMutableMemory();
+		return true;
 	}
 }
 
@@ -900,16 +864,29 @@ FMonolithReflectionWalker::FPathResolveResult FMonolithReflectionWalker::Resolve
 				// FInstancedStruct / TInstancedStruct<T>: the members live in the held
 				// struct, whose type is only known at runtime.
 				FInstancedStruct& Instanced = *static_cast<FInstancedStruct*>(ResolvedPtr);
-				const UScriptStruct* HeldStruct = Instanced.GetScriptStruct();
-				if (!HeldStruct || !Instanced.GetMutableMemory())
+				if (!Instanced.IsValid())
 				{
-					const FString Element = Seg.bHasBracket ? FString::Printf(TEXT("%s[%s]"), *Seg.Member, *Seg.Bracket) : Seg.Member;
+					// Path walked so far, so the hint resolves from the root.
+					FString Element;
+					for (int32 WalkedIdx = 0; WalkedIdx <= SegIdx; ++WalkedIdx)
+					{
+						const FPathSegment& Walked = Segments[WalkedIdx];
+						if (WalkedIdx > 0)
+						{
+							Element += TEXT(".");
+						}
+						Element += Walked.Member;
+						if (Walked.bHasBracket)
+						{
+							Element += FString::Printf(TEXT("[%s]"), *Walked.Bracket);
+						}
+					}
 					Result.Error = FString::Printf(
 						TEXT("cannot descend through '%s': the instanced struct is empty (no struct type set). Write the whole element first, e.g. path '%s' with value '/Script/Module.StructName(Field=...)'"),
 						*Element, *Element);
 					return Result;
 				}
-				CurStruct = const_cast<UScriptStruct*>(HeldStruct);
+				CurStruct = const_cast<UScriptStruct*>(Instanced.GetScriptStruct());
 				CurPtr = Instanced.GetMutableMemory();
 				continue;
 			}
@@ -1392,7 +1369,8 @@ void FMonolithReflectionWalker::WriteObjectRef(FObjectProperty* ObjProp, void* V
 	UObject* OldRef = ObjProp->GetObjectPropertyValue(ValuePtr);
 	OutWrite.CurrentValue = OldRef ? OldRef->GetPathName() : FString();
 
-	if (PathStr.IsEmpty())
+	// "None" is what the reflection reader emits for a null reference.
+	if (PathStr.IsEmpty() || PathStr == TEXT("None"))
 	{
 		ObjProp->SetObjectPropertyValue(ValuePtr, nullptr);
 		OutWrite.bOk = true;
@@ -1582,15 +1560,6 @@ void FMonolithReflectionWalker::WriteSet(FSetProperty* SetProp, void* ValuePtr, 
 // ---------------------------------------------------------------------------
 void FMonolithReflectionWalker::WriteStruct(FStructProperty* StructProp, void* ValuePtr, const TSharedPtr<FJsonValue>& JsonVal, UObject* Owner, const FBulkFillSpec& Spec, FDryRunReport& OutReport, const FString& PathPrefix, FBulkFillFieldWrite& OutWrite)
 {
-	// Instanced struct, object form -> walk into the held struct. "__struct" (the key the
-	// reflection reader emits) selects the type: the instance is re-created when it names
-	// a different struct, so a read -> edit -> write round trip works unchanged.
-	if (JsonVal->Type == EJson::Object && IsInstancedStructProperty(StructProp))
-	{
-		WriteInstancedStructObject(StructProp, ValuePtr, JsonVal, Owner, Spec, OutReport, PathPrefix, OutWrite);
-		return;
-	}
-
 	// Object form -> recursive walk into the nested struct's properties.
 	if (JsonVal->Type == EJson::Object)
 	{
@@ -1610,28 +1579,47 @@ void FMonolithReflectionWalker::WriteStruct(FStructProperty* StructProp, void* V
 			return;
 		}
 
+		// An instanced struct walks into the struct it holds, so a read -> edit -> write
+		// round trip works unchanged. The empty object above is what the reader emits for
+		// an empty instance.
+		UStruct* FieldsStruct = StructProp->Struct;
+		void* FieldsPtr = ValuePtr;
+		const bool bInstanced = IsInstancedStructProperty(StructProp);
+		if (bInstanced && !ResolveInstancedStructTarget(StructProp, ValuePtr, **NestedObj, OutWrite, FieldsStruct, FieldsPtr))
+		{
+			return;
+		}
+
+		int32 FieldCount = 0;
 		int32 LocalErrors = 0;
 		for (const auto& Pair : (*NestedObj)->Values)
 		{
 			const FString PairKeyStr = MonolithKeyToString(Pair.Key);
+			if (bInstanced && PairKeyStr == TEXT("__struct"))
+			{
+				continue;
+			}
+			++FieldCount;
 			FBulkFillFieldWrite W;
 			W.Path = FString::Printf(TEXT("%s.%s"), *PathPrefix, *PairKeyStr);
-			FProperty* InnerProp = FindPropertyForwarding(StructProp->Struct, PairKeyStr);
+			FProperty* InnerProp = FindPropertyForwarding(FieldsStruct, PairKeyStr);
 			if (!InnerProp)
 			{
 				W.bOk = false;
-				W.Reason = FString::Printf(TEXT("unknown field '%s' on %s"), *PairKeyStr, *StructProp->Struct->GetName());
+				W.Reason = FString::Printf(TEXT("unknown field '%s' on %s"), *PairKeyStr, *FieldsStruct->GetName());
 				OutReport.FieldWrites.Add(W);
 				++LocalErrors;
 				continue;
 			}
-			void* InnerPtr = InnerProp->ContainerPtrToValuePtr<void>(ValuePtr);
+			void* InnerPtr = InnerProp->ContainerPtrToValuePtr<void>(FieldsPtr);
 			DispatchByPropertyType(InnerProp, InnerPtr, Pair.Value, Owner, Spec, OutReport, W.Path, W);
 			if (!W.bOk) { ++LocalErrors; }
 			OutReport.FieldWrites.Add(W);
 		}
 		OutWrite.bOk = (LocalErrors == 0);
-		OutWrite.ProposedValue = FString::Printf(TEXT("{%d fields}"), (*NestedObj)->Values.Num());
+		OutWrite.ProposedValue = bInstanced
+			? FString::Printf(TEXT("%s {%d fields}"), *FieldsStruct->GetPathName(), FieldCount)
+			: FString::Printf(TEXT("{%d fields}"), FieldCount);
 		if (!OutWrite.bOk)
 		{
 			OutWrite.Reason = FString::Printf(TEXT("%d nested write(s) failed"), LocalErrors);
@@ -1827,10 +1815,18 @@ FSchemaDescriptor FMonolithReflectionWalker::DescribeStruct(UStruct* TopStruct, 
 		}
 		else if (FStructProperty* StructProp = CastField<FStructProperty>(Prop))
 		{
-			Child.ImportTextForm = TEXT("(Field1=...,Field2=...)");
-			if (MaxDepth > 1 && StructProp->Struct)
+			if (IsInstancedStructProperty(StructProp))
 			{
-				Child.Children.Add(DescribeStruct(StructProp->Struct, MaxDepth - 1));
+				// The held type is per instance: the literal names it and there are no fixed children.
+				Child.ImportTextForm = TEXT("/Script/Module.StructName(Field1=...,Field2=...)");
+			}
+			else
+			{
+				Child.ImportTextForm = TEXT("(Field1=...,Field2=...)");
+				if (MaxDepth > 1 && StructProp->Struct)
+				{
+					Child.Children.Add(DescribeStruct(StructProp->Struct, MaxDepth - 1));
+				}
 			}
 		}
 		else if (FMapProperty* MapProp = CastField<FMapProperty>(Prop))

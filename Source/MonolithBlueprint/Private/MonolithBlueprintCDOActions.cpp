@@ -75,7 +75,10 @@ void FMonolithBlueprintCDOActions::RegisterActions(FMonolithToolRegistry& Regist
 			 "(DataAsset, GameplayEffect, etc.) via generic reflection. Path is dotted + bracket: "
 			 "'.' descends into struct members, '[N]' indexes an array, '[Key]' keys a map "
 			 "(enum name, integer, FName, or string — imported through the map's key grammar). "
-			 "Example: 'Standing.Gaits[Jog].Starts.Forward'. The leaf value accepts scalars, "
+			 "Example: 'Standing.Gaits[Jog].Starts.Forward'. A path continues through an instanced "
+			 "struct (FInstancedStruct / TInstancedStruct) into the struct it holds, e.g. "
+			 "'Fragments[1].EquipmentMesh'; an empty instance must be written whole first "
+			 "(value '/Script/Module.StructName(Field=...)'). The leaf value accepts scalars, "
 			 "enum names, ImportText struct literals, hard object refs and TSoftObjectPtr asset "
 			 "paths, identical to set_cdo_property. Surgical: sibling array elements / map keys are "
 			 "left untouched (unlike set_cdo_properties which rebuilds whole collections). Writes "
@@ -107,6 +110,8 @@ void FMonolithBlueprintCDOActions::RegisterActions(FMonolithToolRegistry& Regist
 	Registry.RegisterAction(TEXT("blueprint"), TEXT("set_cdo_properties"),
 		TEXT("Bulk-fill multiple CDO properties from a JSON tree in a single transaction. "
 			 "Supports nested structs, arrays, maps, sets, enums, and soft-object refs. "
+			 "An instanced struct (FInstancedStruct / TInstancedStruct) is an object whose '__struct' "
+			 "key, as get_cdo_properties emits it, names the held type (/Script/Module.StructName). "
 			 "Supports dry_run + strict. Phase 1 pilot of the bulk_fill framework."),
 		FMonolithActionHandler::CreateStatic(&MonolithCDOPhase1Internal::HandleSetCDOProperties),
 		FParamSchemaBuilder()
