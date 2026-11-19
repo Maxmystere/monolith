@@ -76,6 +76,9 @@ public:
 	 */
 	static bool IsDeprecatedProperty(const FProperty* Prop, FString& OutReason);
 
+	/** True for an FInstancedStruct property (TInstancedStruct<T> reflects as one, with BaseStruct metadata). */
+	static bool IsInstancedStructProperty(const FProperty* Prop);
+
 	/**
 	 * "unknown field 'Name' on Struct", plus " — did you mean 'A', 'B'?" with the closest
 	 * field names on Struct when any are close enough (MonolithNameSuggest).
@@ -173,7 +176,9 @@ public:
 	 * from Container/TopStruct down to a single leaf value pointer.
 	 *
 	 * Path grammar:
-	 *   - "."   descends into an FStructProperty member.
+	 *   - "."   descends into an FStructProperty member. Through an FInstancedStruct /
+	 *           TInstancedStruct<T> it continues into the struct the instance holds
+	 *           (an empty instance is an error).
 	 *   - "[N]" indexes an FArrayProperty (N = integer literal). Out-of-range errors.
 	 *   - "[K]" keys an FMapProperty; K is ImportText'd through the map's KeyProp,
 	 *           so enum names ("Jog"), integers, FName/string keys all resolve.
