@@ -108,6 +108,24 @@ description: Use when working with Unreal Engine UI via Monolith MCP — creatin
 
 ---
 
+## MVVM Actions (14, conditional)
+
+Registered only when the project enables the ModelViewViewModel ("UMG Viewmodel") plugin and the build is not a release build. `get_widget_bindings` does not see MVVM bindings: use `mvvm_get_view`.
+
+Paths: `viewmodel:<Name>.<Field>` (alias `vm:`), `widget:<Name>.<Field>`, `self:<Field>`. Writes compile by default and are refused during PIE.
+
+| Action | Purpose |
+|---|---|
+| `mvvm_get_view` | Read viewmodels, bindings, events, conditions, view extensions; `widget` filters (pins included) |
+| `mvvm_add_viewmodel` / `mvvm_remove_viewmodel` / `mvvm_rename_viewmodel` | Viewmodels; remove refuses while bindings/events/conditions use it unless `remove_bindings=true` |
+| `mvvm_add_binding` / `mvvm_remove_binding` | Bindings, with `mode`, `execution_mode`, forward `conversion_function` |
+| `mvvm_add_event` / `mvvm_set_event_argument` / `mvvm_remove_event` | Widget delegate -> function; arguments take a `path` or a literal `value` |
+| `mvvm_add_condition` / `mvvm_remove_condition` | Call a function when a value passes `operation` against `value` / `max_value` |
+| `mvvm_add_panel_extension` / `mvvm_remove_panel_extension` | Empty panel -> one `entry_widget_class` per viewmodel of a list |
+| `mvvm_set_field_notify` | Make a Blueprint variable FieldNotify (viewmodel Blueprints) |
+
+---
+
 ## CommonUI Actions (50, v0.14.0, conditional)
 
 Require the CommonUI engine plugin. Stock in UE 5.7 at `Engine/Plugins/Runtime/CommonUI/`. Build.cs detects via 3-location scan; missing plugin → actions silently unregister.
