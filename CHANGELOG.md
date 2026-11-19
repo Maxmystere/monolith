@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **MonolithBlueprint did not compile on UE 5.8 with clang (`-Werror,-Wrange-loop-construct`).** The two loops of `restore_instance_component_values` bound the JSON object's entries as `const TPair<FString, TSharedPtr<FJsonValue>>&`; on 5.8 the key is an `FSharedString`, so each entry was copied into a temporary. They now bind with `auto` and convert the key with `MonolithKeyToString`, like the other JSON-object loops.
+
 ## [0.25.0] - 2026-11-20
 
 > **Action count is approximate.** **~1,500+ actions across 27 in-tree namespaces** - query `monolith_discover()` for the live figure.

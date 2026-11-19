@@ -2053,9 +2053,11 @@ FMonolithActionResult FMonolithBlueprintComponentActions::HandleRestoreInstanceC
 	FScopedTransaction Transaction(NSLOCTEXT("MonolithBlueprintComponentActions", "RestoreInstanceComponentValues", "Monolith Restore Instance Component Values"));
 	Actor->Modify();
 
-	for (const TPair<FString, TSharedPtr<FJsonValue>>& CompPair : ValuesJson->Values)
+	// Key type differs between engines (FString on 5.7, FSharedString on 5.8): bind with auto and convert.
+	for (const auto& CompPair : ValuesJson->Values)
 	{
-		if (!Filter.IsEmpty() && !CompPair.Key.Equals(Filter, ESearchCase::IgnoreCase))
+		const FString CompKey = MonolithKeyToString(CompPair.Key);
+		if (!Filter.IsEmpty() && !CompKey.Equals(Filter, ESearchCase::IgnoreCase))
 		{
 			continue;
 		}
@@ -2063,28 +2065,29 @@ FMonolithActionResult FMonolithBlueprintComponentActions::HandleRestoreInstanceC
 		const TSharedPtr<FJsonObject>* PropsObj = nullptr;
 		if (!CompPair.Value.IsValid() || !CompPair.Value->TryGetObject(PropsObj) || !PropsObj || !PropsObj->IsValid())
 		{
-			FailedArr.Add(BpComponentSwapOneSkipJson(CompPair.Key, TEXT("*"), TEXT("component entry is not an object of property -> text")));
+			FailedArr.Add(BpComponentSwapOneSkipJson(CompKey, TEXT("*"), TEXT("component entry is not an object of property -> text")));
 			continue;
 		}
 
-		UActorComponent* Comp = BpComponentSwapFindActorComponent(Actor, CompPair.Key);
+		UActorComponent* Comp = BpComponentSwapFindActorComponent(Actor, CompKey);
 		if (!Comp)
 		{
-			FailedArr.Add(BpComponentSwapOneSkipJson(CompPair.Key, TEXT("*"), FString::Printf(TEXT("component not found; components: %s"),
+			FailedArr.Add(BpComponentSwapOneSkipJson(CompKey, TEXT("*"), FString::Printf(TEXT("component not found; components: %s"),
 				*BpComponentSwapListComponentNames(Actor))));
 			continue;
 		}
 
 		TArray<FBpComponentSwapPropValue> Values;
-		for (const TPair<FString, TSharedPtr<FJsonValue>>& PropPair : (*PropsObj)->Values)
+		for (const auto& PropPair : (*PropsObj)->Values)
 		{
+			const FString PropKey = MonolithKeyToString(PropPair.Key);
 			FString Text;
 			if (!PropPair.Value.IsValid() || !PropPair.Value->TryGetString(Text))
 			{
-				FailedArr.Add(BpComponentSwapOneSkipJson(Comp->GetName(), PropPair.Key, TEXT("value must be export text (string)")));
+				FailedArr.Add(BpComponentSwapOneSkipJson(Comp->GetName(), PropKey, TEXT("value must be export text (string)")));
 				continue;
 			}
-			Values.Add({ PropPair.Key, Text });
+			Values.Add({ PropKey, Text });
 		}
 
 		FBpComponentSwapApplyReport Report;
