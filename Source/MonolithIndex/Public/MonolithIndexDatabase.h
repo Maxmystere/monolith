@@ -48,6 +48,16 @@ struct FIndexedNode
 	int32 PosY = 0;
 };
 
+/** A literal default typed into an unlinked input pin of a graph node (Blueprint pin defaults). */
+struct FIndexedPinDefault
+{
+	int64 Id = 0;
+	int64 NodeId = 0;
+	FString GraphName;
+	FString PinName;
+	FString Value;
+};
+
 struct FIndexedConnection
 {
 	int64 Id = 0;
@@ -152,6 +162,11 @@ struct FSearchResult
 	FString ModuleName;
 	FString MatchContext; // snippet around the match
 	float Rank = 0.0f;
+
+	// Set only on a pin-default hit: where the literal was typed.
+	FString GraphName;
+	FString NodeName;
+	FString PinName;
 };
 
 /** Outcome of a project full-text search, so caller mistakes stay distinct from index failures. */
@@ -200,6 +215,12 @@ MONOLITHINDEX_API EMonolithDeepIndexQueueDecision MonolithDecideDeepIndexQueueEn
 
 /** Attempts at which an asset is treated as poisonous and dropped from the queue. */
 inline constexpr int32 MonolithMaxDeepIndexAttempts = 2;
+
+/**
+ * `deep_indexed_hash` of a row whose child rows predate the current schema. Never
+ * equal to a real hash, and not empty: an empty checkpoint means "no child rows".
+ */
+inline constexpr const TCHAR* MonolithStaleDeepIndexMarker = TEXT("pre-v4");
 
 /**
  * RAII wrapper around FSQLiteDatabase for the Monolith project index.
@@ -315,6 +336,9 @@ public:
 	/** Reset the attempt counter after a successful deep index. */
 	bool ClearDeepIndexAttempts(int64 AssetId);
 
+	/** Rows stamped MonolithStaleDeepIndexMarker. Fills id, path, class, saved hash and attempts only. */
+	TArray<FIndexedAsset> GetAssetsWithStaleDeepIndex();
+
 	/** Paths dropped from the deep queue by the poison-pill rule, oldest first. */
 	TArray<FString> GetSkippedAssetPaths() const;
 
@@ -329,6 +353,15 @@ public:
 
 	// --- DataTable Row CRUD ---
 	int64 InsertDataTableRow(const FIndexedDataTableRow& Row);
+
+	// --- Pin default CRUD (schema v4) ---
+	int64 InsertPinDefault(const FIndexedPinDefault& PinDefault);
+
+	/** True when the pin_defaults tables exist (schema v4 or later). */
+	bool HasPinDefaults() const { return bHasPinDefaults; }
+
+	/** Schema version written by Open() / ResetDatabase(). */
+	static constexpr int32 CurrentSchemaVersion = 4;
 
 	// --- FTS5 Search ---
 	TArray<FSearchResult> FullTextSearch(const FString& Query, int32 Limit = 50);
@@ -376,5 +409,8 @@ private:
 	bool CreateTables();
 	bool ExecuteSQL(const FString& SQL);
 	FSQLiteDatabase* Database = nullptr;
+
+	/** Set by Open() and ResetDatabase(): whether the pin_defaults tables are there to search. */
+	bool bHasPinDefaults = false;
 	FString DbPath;
 };

@@ -20,5 +20,6 @@ public:
 
 private:
 	void IndexGraph(class UEdGraph* Graph, FMonolithIndexDatabase& DB, int64 AssetId);
+	void IndexPinDefaults(class UEdGraphNode* Node, class UEdGraph* Graph, int64 NodeId, FMonolithIndexDatabase& DB);
 	void IndexVariables(class UBlueprint* Blueprint, FMonolithIndexDatabase& DB, int64 AssetId);
 };

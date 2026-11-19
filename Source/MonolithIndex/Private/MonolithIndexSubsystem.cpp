@@ -222,7 +222,7 @@ void UMonolithIndexSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		if (AR.IsLoadingAssets())
 			AR.OnFilesLoaded().AddUObject(this, &UMonolithIndexSubsystem::OnAssetRegistryFilesLoadedIncremental);
 		else
-			StartIncrementalIndex();
+			OnAssetRegistryFilesLoadedIncremental();
 	}
 	else
 	{
@@ -256,6 +256,9 @@ void UMonolithIndexSubsystem::OnAssetRegistryFilesLoadedIncremental()
 	// OnFilesLoaded is a void multicast; StartIncrementalIndex reports a result,
 	// so it needs an adapter rather than binding directly.
 	StartIncrementalIndex();
+
+	// After the delta pass, which is synchronous: the two never overlap.
+	StartStaleReindex();
 }
 
 void UMonolithIndexSubsystem::Deinitialize()
@@ -394,7 +397,77 @@ bool UMonolithIndexSubsystem::ResumeFullIndex()
 	return StartFullIndexInternal(/*bForceReset=*/false);
 }
 
-bool UMonolithIndexSubsystem::StartFullIndexInternal(bool bForceReset)
+bool UMonolithIndexSubsystem::StartStaleReindex()
+{
+	check(IsInGameThread());
+	if (bIsIndexing || !Database.IsValid() || !Database->IsOpen())
+	{
+		return false;
+	}
+
+	const TArray<FIndexedAsset> StaleAssets = Database->GetAssetsWithStaleDeepIndex();
+	if (StaleAssets.Num() == 0)
+	{
+		return false;
+	}
+
+	// Same escape hatch as the first-time index: this run loads every stale asset.
+	if (GetDefault<UMonolithSettings>()->bDeferFirstTimeIndex)
+	{
+		UE_LOG(LogMonolithIndex, Log,
+			TEXT("MonolithIndex: %d assets need re-indexing for the current schema but it is deferred via bDeferFirstTimeIndex; run Monolith.StartIndex force to rebuild the index"),
+			StaleAssets.Num());
+		return false;
+	}
+
+	IAssetRegistry& AR = IAssetRegistry::GetChecked();
+	TArray<FDeepIndexEntry> StaleQueue;
+	TArray<FString> PoisonedPaths;
+	for (const FIndexedAsset& Asset : StaleAssets)
+	{
+		const TSharedPtr<IMonolithIndexer>* Indexer = ClassToIndexer.Find(Asset.AssetClass);
+		TArray<FAssetData> Assets;
+		AR.GetAssetsByPackageName(FName(*Asset.PackagePath), Assets);
+
+		const bool bPoison = MonolithDecideDeepIndexQueueEntry(Asset.DeepIndexedHash, Asset.DeepIndexAttempts, Asset.SavedHash)
+			== EMonolithDeepIndexQueueDecision::SkipPoisonAsset;
+		if (bPoison || !Indexer || !Indexer->IsValid() || Assets.Num() == 0)
+		{
+			// Nothing to run, or two runs already died on it: stamp the hash so the
+			// row leaves the stale set instead of being retried on every launch.
+			Database->SetDeepIndexedHash(Asset.Id, Asset.SavedHash);
+			if (bPoison)
+			{
+				PoisonedPaths.Add(Asset.PackagePath);
+			}
+			continue;
+		}
+
+		FDeepIndexEntry Entry;
+		Entry.AssetData = Assets[0];
+		Entry.AssetId = Asset.Id;
+		Entry.Indexer = *Indexer;
+		Entry.SavedHash = Asset.SavedHash;
+		Entry.bReplaceChildRows = true;
+		StaleQueue.Add(MoveTemp(Entry));
+	}
+
+	if (PoisonedPaths.Num() > 0)
+	{
+		Database->RecordSkippedAssetPaths(PoisonedPaths);
+		UE_LOG(LogMonolithIndex, Error,
+			TEXT("%d stale asset(s) were dropped from re-indexing after repeated interrupted attempts; see project get_stats 'skipped_assets'"),
+			PoisonedPaths.Num());
+	}
+
+	if (StaleQueue.Num() == 0)
+	{
+		return false;
+	}
+	return StartFullIndexInternal(/*bForceReset=*/false, MoveTemp(StaleQueue));
+}
+
+bool UMonolithIndexSubsystem::StartFullIndexInternal(bool bForceReset, TArray<FDeepIndexEntry> StaleQueue)
 {
 	if (bIsIndexing)
 	{
@@ -411,7 +484,9 @@ bool UMonolithIndexSubsystem::StartFullIndexInternal(bool bForceReset)
 	// Resume only when the schema can actually store checkpoints. `full_index_state`
 	// is a `meta` row, so it survives a failed COLUMN migration — gating on the
 	// marker alone would resume onto a v2 schema with nowhere to record progress.
-	const bool bResume = !bForceReset
+	const bool bStaleOnly = StaleQueue.Num() > 0;
+	const bool bResume = !bStaleOnly
+		&& !bForceReset
 		&& Database->SupportsIndexResume()
 		&& Database->IsFullIndexInProgress();
 
@@ -423,7 +498,12 @@ bool UMonolithIndexSubsystem::StartFullIndexInternal(bool bForceReset)
 	// defensively in Deinitialize() (editor shutdown mid-index). Game thread.
 	GIncrementalGCOverride = MakeUnique<FIncrementalReachabilityGCOverride>();
 
-	if (bResume)
+	if (bStaleOnly)
+	{
+		UE_LOG(LogMonolithIndex, Log,
+			TEXT("Re-indexing %d assets whose deep index predates the current schema"), StaleQueue.Num());
+	}
+	else if (bResume)
 	{
 		UE_LOG(LogMonolithIndex, Log,
 			TEXT("Resuming an interrupted full index — already-indexed assets keep their data and are not re-deep-indexed"));
@@ -464,6 +544,7 @@ bool UMonolithIndexSubsystem::StartFullIndexInternal(bool bForceReset)
 	IndexingTaskPtr = MakeUnique<FIndexingTask>(this);
 	IndexingTaskPtr->PluginsToIndex = IndexedPlugins;
 	IndexingTaskPtr->bIsResume = bResume;
+	IndexingTaskPtr->StaleQueue = MoveTemp(StaleQueue);
 	IndexingThread.Reset(FRunnableThread::Create(
 		IndexingTaskPtr.Get(),
 		TEXT("MonolithIndexing"),
@@ -649,6 +730,9 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 	// Anything it needs must be copied into the capture list beforehand.
 	const TWeakObjectPtr<UMonolithIndexSubsystem> WeakOwner(Owner);
 
+	// Read before the queue below takes the entries.
+	const bool bStaleOnly = StaleQueue.Num() > 0;
+
 	if (bLogMemory)
 	{
 		FMonolithMemoryHelper::LogMemoryStats(TEXT("Full index starting"));
@@ -667,58 +751,61 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 	};
 	TSharedPtr<FRegistryScan> Scan = MakeShared<FRegistryScan>();
 	Scan->Plugins = PluginsToIndex;
-	Scan->Event = FPlatformProcess::GetSynchEventFromPool(true);
-	AsyncTask(ENamedThreads::GameThread, [Scan]()
+	if (!bStaleOnly)
 	{
-		IAssetRegistry& AssetRegistry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
-
-		if (!AssetRegistry.IsSearchAllAssets())
+		Scan->Event = FPlatformProcess::GetSynchEventFromPool(true);
+		AsyncTask(ENamedThreads::GameThread, [Scan]()
 		{
-			AssetRegistry.SearchAllAssets(true);
-		}
-		AssetRegistry.WaitForCompletion();
+			IAssetRegistry& AssetRegistry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
 
-		FARFilter Filter;
-		Filter.PackagePaths.Add(FName(TEXT("/Game")));
-		// Add marketplace plugin mount paths
-		for (const FIndexedPluginInfo& PluginInfo : Scan->Plugins)
-		{
-			FString CleanPath = PluginInfo.MountPath;
-			if (CleanPath.EndsWith(TEXT("/")))
+			if (!AssetRegistry.IsSearchAllAssets())
 			{
-				CleanPath.LeftChopInline(1);
+				AssetRegistry.SearchAllAssets(true);
 			}
-			Filter.PackagePaths.Add(FName(*CleanPath));
-		}
-		// Add user-configured additional content paths
-		{
-			const UMonolithSettings* Settings = GetDefault<UMonolithSettings>();
-			if (Settings)
+			AssetRegistry.WaitForCompletion();
+
+			FARFilter Filter;
+			Filter.PackagePaths.Add(FName(TEXT("/Game")));
+			// Add marketplace plugin mount paths
+			for (const FIndexedPluginInfo& PluginInfo : Scan->Plugins)
 			{
-				for (const FString& CustomPath : Settings->AdditionalContentPaths)
+				FString CleanPath = PluginInfo.MountPath;
+				if (CleanPath.EndsWith(TEXT("/")))
 				{
-					if (!CustomPath.IsEmpty())
+					CleanPath.LeftChopInline(1);
+				}
+				Filter.PackagePaths.Add(FName(*CleanPath));
+			}
+			// Add user-configured additional content paths
+			{
+				const UMonolithSettings* Settings = GetDefault<UMonolithSettings>();
+				if (Settings)
+				{
+					for (const FString& CustomPath : Settings->AdditionalContentPaths)
 					{
-						FString CleanPath = CustomPath;
-						if (CleanPath.EndsWith(TEXT("/")))
+						if (!CustomPath.IsEmpty())
 						{
-							CleanPath.LeftChopInline(1);
+							FString CleanPath = CustomPath;
+							if (CleanPath.EndsWith(TEXT("/")))
+							{
+								CleanPath.LeftChopInline(1);
+							}
+							Filter.PackagePaths.AddUnique(FName(*CleanPath));
 						}
-						Filter.PackagePaths.AddUnique(FName(*CleanPath));
 					}
 				}
 			}
-		}
-		Filter.bRecursivePaths = true;
-		AssetRegistry.GetAssets(Filter, Scan->Assets);
+			Filter.bRecursivePaths = true;
+			AssetRegistry.GetAssets(Filter, Scan->Assets);
 
-		Scan->Event->Trigger();
-	});
-	if (!WaitForGameThreadEvent(Scan->Event))
-	{
-		return 1; // engine exit — event deliberately leaked, see the helper
+			Scan->Event->Trigger();
+		});
+		if (!WaitForGameThreadEvent(Scan->Event))
+		{
+			return 1; // engine exit — event deliberately leaked, see the helper
+		}
+		FPlatformProcess::ReturnSynchEventToPool(Scan->Event);
 	}
-	FPlatformProcess::ReturnSynchEventToPool(Scan->Event);
 
 	TArray<FAssetData> AllAssets = MoveTemp(Scan->Assets);
 
@@ -769,15 +856,9 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 	int32 Indexed = 0;
 	int32 Errors = 0;
 
-	// Collect assets that have deep indexers for a second pass
-	struct FDeepIndexEntry
-	{
-		FAssetData AssetData;
-		int64 AssetId;
-		TSharedPtr<IMonolithIndexer> Indexer;
-		FString SavedHash;
-	};
-	TArray<FDeepIndexEntry> DeepIndexQueue;
+	// Collect assets that have deep indexers for a second pass. A stale re-index
+	// arrives with the queue already built and nothing scanned above.
+	TArray<FDeepIndexEntry> DeepIndexQueue = MoveTemp(StaleQueue);
 
 	// Resume bookkeeping.
 	int32 AlreadyDeepIndexed = 0;
@@ -1170,6 +1251,10 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 					UObject* LoadedAsset = Entry.AssetData.GetAsset();
 					if (LoadedAsset)
 					{
+						if (Entry.bReplaceChildRows)
+						{
+							DB->DeleteChildDataForAsset(Entry.AssetId);
+						}
 						if (Entry.Indexer->IndexAsset(Entry.AssetData, LoadedAsset, *DB, Entry.AssetId))
 						{
 							DeepIndexed++;
@@ -1296,6 +1381,21 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 		{
 			FMonolithMemoryHelper::LogMemoryStats(TEXT("Deep index complete"));
 		}
+	}
+
+	// A stale re-index ends here: the post-pass indexers own tables it did not
+	// touch, and the completion marker belongs to a full index.
+	if (bStaleOnly)
+	{
+		const bool bRanToEnd = !bShouldStop.Load() && !bTransactionFailure.Load();
+		AsyncTask(ENamedThreads::GameThread, [WeakOwner, bRanToEnd]()
+		{
+			if (UMonolithIndexSubsystem* Subsystem = WeakOwner.Get())
+			{
+				Subsystem->OnIndexingFinished(bRanToEnd);
+			}
+		});
+		return 0;
 	}
 
 	// Build indexed paths list for post-pass indexers

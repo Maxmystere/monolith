@@ -37,12 +37,13 @@ All asset paths follow UE content browser format (no .uasset extension):
 
 ## What `search` Indexes
 
-`search` runs the query against two FTS5 tables and merges the hits:
+`search` runs the query against three FTS5 tables and merges the hits:
 
 | Table | Indexed columns |
 |-------|-----------------|
 | assets | `asset_name`, `asset_class`, `description`, `package_path`, `module_name` |
 | graph nodes | `node_name`, `node_class`, `node_type` |
+| Blueprint pin defaults | `value`, `pin_name` — literals typed into unlinked input pins (a socket name, a string, an asset path). Hits add `match_kind: "pin_default"`, `graph`, `node`, `pin` |
 
 Variables and parameters are **not** in the full-text index — they are indexed as
 structured rows, so reach them via `get_asset_details`, not `search`.

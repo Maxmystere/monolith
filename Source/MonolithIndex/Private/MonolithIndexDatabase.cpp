@@ -208,6 +208,41 @@ CREATE TRIGGER IF NOT EXISTS fts_nodes_au AFTER UPDATE ON nodes BEGIN
     VALUES (new.id, new.node_name, new.node_class, new.node_type);
 END;
 
+-- Literal defaults typed into unlinked input pins (schema v4). One row per pin, so a
+-- search hit names the node and pin. Rows go away with their node.
+-- (No semicolons in these comments: CreateTables splits this script on them.)
+CREATE TABLE IF NOT EXISTS pin_defaults (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    graph_name TEXT DEFAULT '',
+    pin_name TEXT NOT NULL,
+    value TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pin_defaults_node ON pin_defaults(node_id);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_pin_defaults USING fts5(
+    value,
+    pin_name,
+    content=pin_defaults,
+    content_rowid=id,
+    tokenize='porter unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS fts_pin_defaults_ai AFTER INSERT ON pin_defaults BEGIN
+    INSERT INTO fts_pin_defaults(rowid, value, pin_name)
+    VALUES (new.id, new.value, new.pin_name);
+END;
+CREATE TRIGGER IF NOT EXISTS fts_pin_defaults_ad AFTER DELETE ON pin_defaults BEGIN
+    INSERT INTO fts_pin_defaults(fts_pin_defaults, rowid, value, pin_name)
+    VALUES ('delete', old.id, old.value, old.pin_name);
+END;
+CREATE TRIGGER IF NOT EXISTS fts_pin_defaults_au AFTER UPDATE ON pin_defaults BEGIN
+    INSERT INTO fts_pin_defaults(fts_pin_defaults, rowid, value, pin_name)
+    VALUES ('delete', old.id, old.value, old.pin_name);
+    INSERT INTO fts_pin_defaults(rowid, value, pin_name)
+    VALUES (new.id, new.value, new.pin_name);
+END;
+
 -- Metadata table for tracking index state
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -215,6 +250,23 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 
 )SQL");
+
+namespace MonolithIndexSchemaDetail
+{
+	// Searchable only when both tables are really there: CreateTables reports success
+	// even when a statement failed, and that must not break project search.
+	static bool HasPinDefaultTables(FSQLiteDatabase& Database)
+	{
+		int64 Found = 0;
+		FSQLitePreparedStatement Stmt;
+		if (Stmt.Create(Database, TEXT("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('pin_defaults', 'fts_pin_defaults');"))
+			&& Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			Stmt.GetColumnValueByIndex(0, Found);
+		}
+		return Found == 2;
+	}
+}
 
 // ============================================================
 // Constructor / Destructor
@@ -354,6 +406,36 @@ bool FMonolithIndexDatabase::Open(const FString& InDbPath)
 		}
 	}
 
+	// Schema migration: v3 -> v4 (pin defaults). The tables come from CreateTables above
+	// (IF NOT EXISTS), so this only has to make existing Blueprints get them: their
+	// checkpoint is stamped stale, and the subsystem re-indexes stale rows in batches
+	// (StartStaleReindex) without a full rebuild. A resumed full index re-queues them
+	// the same way. Skipped when v3 did not land.
+	{
+		const int32 Version = FCString::Atoi(*ReadMeta(TEXT("schema_version")));
+		if (Version == 3)
+		{
+			// Not '': an empty checkpoint means "no child rows", and these rows have them.
+			// saved_hash is left alone, or the incremental pass would load every Blueprint
+			// in one unbatched call. Poison assets (attempt limit reached) are not touched.
+			const bool bMigrated = ExecuteSQL(FString::Printf(TEXT(
+				"UPDATE assets SET deep_indexed_hash = '%s' "
+				"WHERE asset_class IN ('Blueprint', 'WidgetBlueprint', 'AnimBlueprint') "
+				"AND deep_index_attempts < %d;"), MonolithStaleDeepIndexMarker, MonolithMaxDeepIndexAttempts));
+			if (bMigrated)
+			{
+				WriteMeta(TEXT("schema_version"), FString::FromInt(CurrentSchemaVersion));
+			}
+			else
+			{
+				UE_LOG(LogMonolithIndex, Error,
+					TEXT("Index schema migration to v4 failed - Blueprint pin defaults stay unindexed until a full reindex"));
+			}
+		}
+	}
+
+	bHasPinDefaults = MonolithIndexSchemaDetail::HasPinDefaultTables(*Database);
+
 	// Ensure hash index exists (safe for both fresh and migrated DBs)
 	ExecuteSQL(TEXT("CREATE INDEX IF NOT EXISTS idx_assets_hash ON assets(saved_hash);"));
 
@@ -387,6 +469,11 @@ bool FMonolithIndexDatabase::ResetDatabase()
 	ExecuteSQL(TEXT("DROP TRIGGER IF EXISTS fts_nodes_ai;"));
 	ExecuteSQL(TEXT("DROP TRIGGER IF EXISTS fts_nodes_ad;"));
 	ExecuteSQL(TEXT("DROP TRIGGER IF EXISTS fts_nodes_au;"));
+	ExecuteSQL(TEXT("DROP TRIGGER IF EXISTS fts_pin_defaults_ai;"));
+	ExecuteSQL(TEXT("DROP TRIGGER IF EXISTS fts_pin_defaults_ad;"));
+	ExecuteSQL(TEXT("DROP TRIGGER IF EXISTS fts_pin_defaults_au;"));
+	ExecuteSQL(TEXT("DROP TABLE IF EXISTS fts_pin_defaults;"));
+	ExecuteSQL(TEXT("DROP TABLE IF EXISTS pin_defaults;"));
 	ExecuteSQL(TEXT("DROP TABLE IF EXISTS fts_assets;"));
 	ExecuteSQL(TEXT("DROP TABLE IF EXISTS fts_nodes;"));
 	ExecuteSQL(TEXT("DROP TABLE IF EXISTS tag_references;"));
@@ -413,7 +500,8 @@ bool FMonolithIndexDatabase::ResetDatabase()
 	// schema version" until the next Open(), and every version-gated path
 	// (incremental indexing, resume) silently degrades for the rest of the session.
 	ExecuteSQL(TEXT("CREATE INDEX IF NOT EXISTS idx_assets_hash ON assets(saved_hash);"));
-	return WriteMeta(TEXT("schema_version"), TEXT("3"));
+	bHasPinDefaults = MonolithIndexSchemaDetail::HasPinDefaultTables(*Database);
+	return WriteMeta(TEXT("schema_version"), FString::FromInt(CurrentSchemaVersion));
 }
 
 // ============================================================
@@ -528,6 +616,24 @@ int64 FMonolithIndexDatabase::InsertNode(const FIndexedNode& Node)
 	Stmt.SetBindingValueByIndex(5, Node.Properties);
 	Stmt.SetBindingValueByIndex(6, static_cast<int64>(Node.PosX));
 	Stmt.SetBindingValueByIndex(7, static_cast<int64>(Node.PosY));
+
+	if (!Stmt.Execute()) return -1;
+	return Database->GetLastInsertRowId();
+}
+
+int64 FMonolithIndexDatabase::InsertPinDefault(const FIndexedPinDefault& PinDefault)
+{
+	if (!IsOpen() || !bHasPinDefaults) return -1;
+
+	FSQLitePreparedStatement Stmt;
+	if (!Stmt.Create(*Database, TEXT("INSERT INTO pin_defaults (node_id, graph_name, pin_name, value) VALUES (?, ?, ?, ?);")))
+	{
+		return -1;
+	}
+	Stmt.SetBindingValueByIndex(1, PinDefault.NodeId);
+	Stmt.SetBindingValueByIndex(2, PinDefault.GraphName);
+	Stmt.SetBindingValueByIndex(3, PinDefault.PinName);
+	Stmt.SetBindingValueByIndex(4, PinDefault.Value);
 
 	if (!Stmt.Execute()) return -1;
 	return Database->GetLastInsertRowId();
@@ -1081,6 +1187,32 @@ bool FMonolithIndexDatabase::ClearDeepIndexAttempts(int64 AssetId)
 	return Stmt.Execute();
 }
 
+TArray<FIndexedAsset> FMonolithIndexDatabase::GetAssetsWithStaleDeepIndex()
+{
+	TArray<FIndexedAsset> Result;
+	if (!IsOpen()) return Result;
+
+	FSQLitePreparedStatement Stmt;
+	if (!Stmt.Create(*Database, TEXT("SELECT id, package_path, asset_class, saved_hash, deep_index_attempts FROM assets WHERE deep_indexed_hash = ?;")))
+	{
+		return Result;
+	}
+	Stmt.SetBindingValueByIndex(1, FString(MonolithStaleDeepIndexMarker));
+
+	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+	{
+		FIndexedAsset Asset;
+		Stmt.GetColumnValueByIndex(0, Asset.Id);
+		Stmt.GetColumnValueByIndex(1, Asset.PackagePath);
+		Stmt.GetColumnValueByIndex(2, Asset.AssetClass);
+		Stmt.GetColumnValueByIndex(3, Asset.SavedHash);
+		Stmt.GetColumnValueByIndex(4, Asset.DeepIndexAttempts);
+		Asset.DeepIndexedHash = MonolithStaleDeepIndexMarker;
+		Result.Add(MoveTemp(Asset));
+	}
+	return Result;
+}
+
 TArray<FString> FMonolithIndexDatabase::GetSkippedAssetPaths() const
 {
 	TArray<FString> Paths;
@@ -1307,10 +1439,10 @@ namespace MonolithProjectSearchDetail
 	}
 
 	/**
-	 * A column filter naming a column this FTS table does not carry. The two
+	 * A column filter naming a column this FTS table does not carry. The
 	 * project FTS tables expose different columns, so on its own this means
 	 * "not answerable here", not "bad query" — `node_name:Branch` is a valid
-	 * search that only fts_nodes can serve. Only a rejection by BOTH tables
+	 * search that only fts_nodes can serve. Only a rejection by EVERY table
 	 * makes it a caller error.
 	 */
 	static bool IsFts5UnknownColumnError(const FString& Error)
@@ -1319,9 +1451,10 @@ namespace MonolithProjectSearchDetail
 	}
 
 	// Mirrors the CREATE VIRTUAL TABLE column lists in the schema DDL above
-	// (fts_assets / fts_nodes). Keep in step with them.
+	// (fts_assets / fts_nodes / fts_pin_defaults). Keep in step with them.
 	static const TCHAR* const AssetFtsColumns = TEXT("asset_name, asset_class, description, package_path, module_name");
 	static const TCHAR* const NodeFtsColumns = TEXT("node_name, node_class, node_type");
+	static const TCHAR* const PinDefaultFtsColumns = TEXT("value, pin_name");
 
 	/**
 	 * Turn SQLite's bare "no such column: node_nme" into something a caller can act
@@ -1345,10 +1478,11 @@ namespace MonolithProjectSearchDetail
 		}
 
 		return FString::Printf(
-			TEXT("%s. Valid columns are %s (assets) or %s (nodes); one filter cannot span both tables."),
+			TEXT("%s. Valid columns are %s (assets), %s (nodes) or %s (pin defaults); one filter cannot span tables."),
 			*Subject,
 			AssetFtsColumns,
-			NodeFtsColumns);
+			NodeFtsColumns,
+			PinDefaultFtsColumns);
 	}
 }
 
@@ -1410,7 +1544,8 @@ EMonolithProjectSearchStatus FMonolithIndexDatabase::FullTextSearch(
 	auto RunSearch = [this, &OutResults, &Query, ClampedLimit, &AssetClassFilter](
 		const TCHAR* SQL,
 		const TCHAR* TableName,
-		FString& AttemptError) -> EAttempt
+		FString& AttemptError,
+		bool bPinColumns = false) -> EAttempt
 	{
 		AttemptError.Reset();
 
@@ -1489,6 +1624,12 @@ EMonolithProjectSearchStatus FMonolithIndexDatabase::FullTextSearch(
 			double RankD = 0.0;
 			Stmt.GetColumnValueByIndex(5, RankD);
 			R.Rank = static_cast<float>(RankD);
+			if (bPinColumns)
+			{
+				Stmt.GetColumnValueByIndex(6, R.GraphName);
+				Stmt.GetColumnValueByIndex(7, R.NodeName);
+				Stmt.GetColumnValueByIndex(8, R.PinName);
+			}
 			TableResults.Add(MoveTemp(R));
 		}
 
@@ -1533,9 +1674,28 @@ EMonolithProjectSearchStatus FMonolithIndexDatabase::FullTextSearch(
 		return ToStatus(NodeAttempt);
 	}
 
+	// And the literal defaults typed into Blueprint pins (schema v4). Each hit names the
+	// graph, node and pin. A DB without the tables just skips this pass.
+	EAttempt PinAttempt = EAttempt::NotApplicable;
+	if (bHasPinDefaults)
+	{
+		const FString PinSQL = FString::Printf(
+			TEXT("SELECT a.package_path, a.asset_name, a.asset_class, a.module_name, snippet(fts_pin_defaults, 0, '>>>', '<<<', '...', 32) as ctx, f.rank, p.graph_name, n.node_name, p.pin_name FROM fts_pin_defaults f JOIN pin_defaults p ON p.id = f.rowid JOIN nodes n ON n.id = p.node_id JOIN assets a ON a.id = n.asset_id WHERE fts_pin_defaults MATCH ?%s ORDER BY f.rank LIMIT ?;"),
+			*ClassPredicate);
+
+		FString PinError;
+		PinAttempt = RunSearch(*PinSQL, TEXT("pin defaults"), PinError, /*bPinColumns=*/true);
+		if (PinAttempt == EAttempt::InvalidQuery || PinAttempt == EAttempt::InternalError)
+		{
+			OutResults.Reset();
+			OutError = PinError;
+			return ToStatus(PinAttempt);
+		}
+	}
+
 	// No FTS table exposes the requested column, so the caller named one that
 	// does not exist anywhere in the index.
-	if (AssetAttempt == EAttempt::NotApplicable && NodeAttempt == EAttempt::NotApplicable)
+	if (AssetAttempt == EAttempt::NotApplicable && NodeAttempt == EAttempt::NotApplicable && PinAttempt == EAttempt::NotApplicable)
 	{
 		OutResults.Reset();
 		OutError = MonolithProjectSearchDetail::DescribeUnknownColumn(AssetError);

@@ -32,6 +32,12 @@ Scoped out while landing the MVVM, skeleton / physics / Control Rig, node-measur
 12. **`material build_material_graph` reports `has_errors: false` when the shader compile logs an error** (seen on UE 5.8: an SM6 "Missing input texture" error for a sampler with no texture). The result should surface material compile errors.
 13. **`set_property_at_path` on a Blueprint resolves from the CDO**, so graph nodes (`UbergraphPages[..].Nodes[@..]`) aren't reachable from the Blueprint's asset path; pass the node's own object path as `asset_path` instead. A `root: asset` option (resolve from the Blueprint object rather than its CDO) would make the sub-object selectors work there too.
 
+## 2026-11-18 — OPEN: offline `project search` does not search pin defaults
+
+`project search` (live) queries the new `pin_defaults` FTS table (index schema v4). `Tools/MonolithQuery/monolith_query.cpp` and `Scripts/monolith_offline.py` still query only `fts_assets` and `fts_nodes`, so offline results miss pin-default hits and their `match_kind` / `graph` / `node` / `pin` fields.
+
+- **Add:** the third query (guarded on the table existing) to both offline tools, then rebuild the exe.
+
 ## 2026-10-18 — OPEN: carried out of 0.24.0
 
 1. **The Windows swap script prompts twice.** `monolith_swap.bat` asks `Install update? (Y/N)` (by design), but its `.git` / `.github` preserve steps call `xcopy` without `/y`, so when both the backup and the staged release contain `.github` the user also gets an `Overwrite ...FUNDING.yml (Yes/No/All)?` prompt mid-install. Found in the v0.24.0 end-to-end rehearsal. Harmless, but this is the auto-update path: any fix needs its own end-to-end rehearsal before it ships.
