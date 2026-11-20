@@ -154,7 +154,10 @@ CREATE TABLE IF NOT EXISTS datatable_rows (
     row_data TEXT DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_dt_asset ON datatable_rows(asset_id);
-
+)SQL")
+// Two adjacent literals, joined by the compiler: MSVC caps each one at 16380 bytes
+// (C2026), and TEXT() makes them wide, 2 bytes per character.
+TEXT(R"SQL(
 -- FTS5 index over assets (name, class, description, path, module)
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_assets USING fts5(
     asset_name,
