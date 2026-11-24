@@ -55,6 +55,11 @@ description: Use when working with Unreal Engine UI via Monolith MCP — creatin
 | `create_animation` | `asset_path`, `animation_name`, `duration`, `tracks` | Create with keyframed tracks |
 | `add_animation_keyframe` | `asset_path`, `animation_name`, `widget_name`, `property`, `time`, `value` | Add keyframe |
 | `remove_animation` | `asset_path`, `animation_name` | Remove animation |
+
+To animate move / scale / rotate with `create_animation_v2`, `add_bezier_eased_segment` or `bake_spring_animation`, use one render-transform channel per track: `RenderTransform.Translation.X`/`.Y`, `RenderTransform.Scale.X`/`.Y`, `RenderTransform.Shear.X`/`.Y`, `RenderTransform.Angle`. They are keyed on the widget's 2D transform track, which is what makes the widget move in game. Key tangents are in value per second.
+
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
 | **Data Binding (4)** | | |
 | `list_widget_events` | `asset_path`, `widget_name`? | Bindable events |
 | `list_widget_properties` | `asset_path`, `widget_name` | Settable properties with types |

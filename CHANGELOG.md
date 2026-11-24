@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ui` widget animations: move, scale and rotate now show in game, and CSS easing curves come out right.** `create_animation_v2`, `add_bezier_eased_segment`, `bake_spring_animation`, the deprecated `create_animation` / `add_animation_keyframe`, and the spec animation builder keyed `RenderTransform.Translation.Y`-style paths on float tracks. For such a nested path the engine writes the struct field directly without calling `SetRenderTransform`, so the Slate widget never moved; only top-level properties with a setter, like `RenderOpacity`, displayed. Render-transform channels (`RenderTransform.Translation.X|Y`, `.Scale.X|Y`, `.Shear.X|Y`, `.Angle`) now go on one `UMovieScene2DTransformTrack` bound to `RenderTransform`, the track the UMG designer makes; a float track an earlier version left on the same path is removed on re-run, any other `RenderTransform*` path is an error, and other nested paths get a `warnings[]` entry. Eased segments stored tangents in value per second where `FMovieSceneTangentData` holds value per tick, and weights that ignored the segment's duration and value change (and were divided by 3); keys are now converted to per-tick slopes, and `add_bezier_eased_segment` (which had its own copy of the math) and the spec builder share one conversion that places each handle at the CSS control point. **Behaviour change:** `create_animation_v2` key `arrive_tangent` / `leave_tangent` are now read as value per second (they were written to the channel unconverted); weights are handle lengths in (seconds, value) space. `add_bezier_eased_segment` now refuses `x1` / `x2` outside [0, 1]. Automation tests `MonolithUI.CreateAnimationV2.RenderTransform` (plays the animation and checks the Slate render transform) and `MonolithUI.AddBezierEasedSegment.MatchesCssCurve`.
+
 ## [0.25.0] - 2026-11-20
 
 > **Action count is approximate.** **~1,500+ actions across 27 in-tree namespaces** - query `monolith_discover()` for the live figure.

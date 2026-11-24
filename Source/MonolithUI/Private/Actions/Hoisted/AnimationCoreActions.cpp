@@ -28,6 +28,8 @@
 #include "Sections/MovieSceneFloatSection.h"
 #include "Channels/MovieSceneFloatChannel.h"
 #include "Channels/MovieSceneCurveChannelCommon.h"
+#include "Animation/MovieScene2DTransformTrack.h"
+#include "Animation/MovieScene2DTransformSection.h"
 
 // Compile
 #include "Kismet2/KismetEditorUtilities.h"
@@ -42,9 +44,130 @@ namespace MonolithUI::AnimationInternal
     static FString ResolvePropertyPath(const FString& PropertyName)
     {
         // UMG animation tracks use the direct UPROPERTY name as the path.
-        // RenderOpacity maps to UWidget::RenderOpacity. ColorAndOpacity / RenderTransform
-        // follow the same pattern.
+        // RenderOpacity maps to UWidget::RenderOpacity. RenderTransform components
+        // never get here: they go to a UMovieScene2DTransformTrack instead.
         return PropertyName;
+    }
+
+    /** Render-transform paths, in UMovieScene2DTransformSection's channel order. */
+    static const TCHAR* const RenderTransformChannelPaths[] =
+    {
+        TEXT("RenderTransform.Translation.X"),
+        TEXT("RenderTransform.Translation.Y"),
+        TEXT("RenderTransform.Angle"),
+        TEXT("RenderTransform.Scale.X"),
+        TEXT("RenderTransform.Scale.Y"),
+        TEXT("RenderTransform.Shear.X"),
+        TEXT("RenderTransform.Shear.Y"),
+    };
+
+    static int32 GetRenderTransformChannelIndex(const FString& PropertyPath)
+    {
+        for (int32 Index = 0; Index < UE_ARRAY_COUNT(RenderTransformChannelPaths); ++Index)
+        {
+            if (PropertyPath.Equals(RenderTransformChannelPaths[Index], ESearchCase::IgnoreCase))
+            {
+                return Index;
+            }
+        }
+        return INDEX_NONE;
+    }
+
+    static FMovieSceneFloatChannel& GetRenderTransformChannel(UMovieScene2DTransformSection& Section, int32 ChannelIndex)
+    {
+        switch (ChannelIndex)
+        {
+        case 0:  return Section.Translation[0];
+        case 1:  return Section.Translation[1];
+        case 2:  return Section.Rotation;
+        case 3:  return Section.Scale[0];
+        case 4:  return Section.Scale[1];
+        case 5:  return Section.Shear[0];
+        default: return Section.Shear[1];
+        }
+    }
+
+    /**
+     * Remove float tracks on this binding whose property path is `PropertyPath`.
+     * Earlier versions keyed render-transform components that way; such a track
+     * writes the struct field without calling SetRenderTransform and would fight the
+     * 2D transform track that replaces it.
+     */
+    static void RemoveFloatTracksWithPath(UMovieScene* Scene, const FGuid& PossessableGuid, const FString& PropertyPath)
+    {
+        const FMovieSceneBinding* Binding = static_cast<const UMovieScene*>(Scene)->FindBinding(PossessableGuid);
+        if (!Binding)
+        {
+            return;
+        }
+
+        TArray<UMovieSceneTrack*> Stale;
+        for (UMovieSceneTrack* Track : Binding->GetTracks())
+        {
+            const UMovieSceneFloatTrack* FloatTrack = Cast<UMovieSceneFloatTrack>(Track);
+            if (FloatTrack && FloatTrack->GetPropertyPath().ToString().Equals(PropertyPath, ESearchCase::IgnoreCase))
+            {
+                Stale.Add(Track);
+            }
+        }
+        for (UMovieSceneTrack* Track : Stale)
+        {
+            Scene->RemoveTrack(*Track);
+        }
+    }
+
+    /** Find or create the RenderTransform 2D transform track + section; return the channel ChannelIndex names. */
+    static FMovieSceneFloatChannel* EnsureRenderTransformChannel(
+        UMovieScene* Scene,
+        const FGuid& PossessableGuid,
+        const FString& PropertyName,
+        int32 ChannelIndex,
+        const TRange<FFrameNumber>& SectionRange,
+        bool bResetExistingKeys)
+    {
+        static const FName RenderTransformName(TEXT("RenderTransform"));
+
+        RemoveFloatTracksWithPath(Scene, PossessableGuid, PropertyName);
+
+        UMovieScene2DTransformTrack* Track = Scene->FindTrack<UMovieScene2DTransformTrack>(PossessableGuid, RenderTransformName);
+        if (!Track)
+        {
+            Track = Scene->AddTrack<UMovieScene2DTransformTrack>(PossessableGuid);
+            if (!Track)
+            {
+                return nullptr;
+            }
+            Track->SetPropertyNameAndPath(RenderTransformName, RenderTransformName.ToString());
+        }
+
+        UMovieScene2DTransformSection* Section = nullptr;
+        if (Track->GetAllSections().Num() > 0)
+        {
+            Section = Cast<UMovieScene2DTransformSection>(Track->GetAllSections()[0]);
+        }
+        if (!Section)
+        {
+            Section = Cast<UMovieScene2DTransformSection>(Track->CreateNewSection());
+            if (!Section)
+            {
+                return nullptr;
+            }
+            Section->SetRange(SectionRange);
+            Track->AddSection(*Section);
+        }
+        else
+        {
+            Section->SetRange(TRange<FFrameNumber>::Hull(Section->GetRange(), SectionRange));
+        }
+
+        // Only the keyed channel is touched: the other components keep their keys, and
+        // components with no keys are not imported, so they keep the widget's value.
+        FMovieSceneFloatChannel& Channel = GetRenderTransformChannel(*Section, ChannelIndex);
+        if (bResetExistingKeys)
+        {
+            Channel.Reset();
+        }
+        return &Channel;
     }
 
     /** Find a widget by name in the WBP's widget tree. */
@@ -142,13 +265,59 @@ namespace MonolithUI::AnimationInternal
         return PossessableGuid;
     }
 
-    /** Find or create a float track + section. Returns the float channel for key insertion. */
+    /**
+     * Find or create the track + section that animates PropertyName. Returns the float
+     * channel for key insertion. See MonolithUI::EnsureFloatTrackSectionChannel.
+     */
     static FMovieSceneFloatChannel* EnsureFloatTrackAndSection(
         UMovieScene* Scene,
         const FGuid& PossessableGuid,
         const FString& PropertyName,
-        const TRange<FFrameNumber>& SectionRange)
+        const TRange<FFrameNumber>& SectionRange,
+        bool bResetExistingKeys = true,
+        FString* OutMessage = nullptr)
     {
+        if (OutMessage)
+        {
+            OutMessage->Reset();
+        }
+
+        const int32 TransformChannel = GetRenderTransformChannelIndex(PropertyName);
+        if (TransformChannel != INDEX_NONE)
+        {
+            FMovieSceneFloatChannel* Channel = EnsureRenderTransformChannel(
+                Scene, PossessableGuid, PropertyName, TransformChannel, SectionRange, bResetExistingKeys);
+            if (!Channel && OutMessage)
+            {
+                *OutMessage = FString::Printf(TEXT("Failed to create RenderTransform track for '%s'"), *PropertyName);
+            }
+            return Channel;
+        }
+
+        if (PropertyName.StartsWith(TEXT("RenderTransform"), ESearchCase::IgnoreCase))
+        {
+            if (OutMessage)
+            {
+                FString Valid;
+                for (const TCHAR* Path : RenderTransformChannelPaths)
+                {
+                    Valid += Valid.IsEmpty() ? FString(Path) : FString::Printf(TEXT(", %s"), Path);
+                }
+                *OutMessage = FString::Printf(
+                    TEXT("'%s' is not an animatable render-transform channel. Use one of: %s"),
+                    *PropertyName, *Valid);
+            }
+            return nullptr;
+        }
+
+        if (OutMessage && PropertyName.Contains(TEXT(".")))
+        {
+            *OutMessage = FString::Printf(
+                TEXT("'%s' is a nested property path: the engine writes it straight into the struct field "
+                     "without calling the widget's setter, so the change may not show on screen"),
+                *PropertyName);
+        }
+
         UMovieSceneFloatTrack* FloatTrack = Scene->FindTrack<UMovieSceneFloatTrack>(PossessableGuid, FName(*PropertyName));
         if (!FloatTrack)
         {
@@ -178,7 +347,10 @@ namespace MonolithUI::AnimationInternal
         else
         {
             // Clear existing keys so repeated calls are idempotent.
-            Section->GetChannel().Reset();
+            if (bResetExistingKeys)
+            {
+                Section->GetChannel().Reset();
+            }
             TRange<FFrameNumber> CurrentRange = Section->GetRange();
             Section->SetRange(TRange<FFrameNumber>::Hull(CurrentRange, SectionRange));
         }
@@ -192,6 +364,7 @@ namespace MonolithUI::AnimationInternal
         double Time = 0.0;
         float Value = 0.0f;
         FString Interp = TEXT("cubic"); // "cubic", "linear", "constant"
+        // Value per second, and handle lengths in (seconds, value) space -- see FAnimationCoreKey.
         float ArriveTangent = 0.0f;
         float LeaveTangent = 0.0f;
         float ArriveTangentWeight = 0.0f;
@@ -214,9 +387,12 @@ namespace MonolithUI::AnimationInternal
         }
         else
         {
+            // FMovieSceneTangentData slopes are value per tick (FWeightedCubicInterpolation
+            // takes atan(Tangent * TicksPerSecond)); weights are already in seconds.
+            const double TicksPerSecond = TickRes.AsDecimal();
             FMovieSceneTangentData TangentData;
-            TangentData.ArriveTangent = Key.ArriveTangent;
-            TangentData.LeaveTangent = Key.LeaveTangent;
+            TangentData.ArriveTangent = static_cast<float>(Key.ArriveTangent / TicksPerSecond);
+            TangentData.LeaveTangent = static_cast<float>(Key.LeaveTangent / TicksPerSecond);
             TangentData.ArriveTangentWeight = Key.ArriveTangentWeight;
             TangentData.LeaveTangentWeight = Key.LeaveTangentWeight;
             TangentData.TangentWeightMode = Key.bHasWeights
@@ -269,26 +445,33 @@ namespace MonolithUI
         const double DurationSec = EndTime - StartTime;
         const double SafeDuration = (DurationSec > 0.0) ? DurationSec : 1e-6;
 
+        // Scale one handle from normalised (time, progress) space into (seconds, value)
+        // space, the space FWeightedCubicInterpolation places handle tips in. A handle
+        // with no time extent would need an infinite slope, so it keeps a sliver of one.
+        constexpr double MinHandleX = 1e-4;
+        auto ScaleHandle = [DeltaValue, SafeDuration](double NormX, double NormY, float& OutSlope, float& OutWeight)
+        {
+            const double HandleSec = FMath::Max(NormX, MinHandleX) * SafeDuration;
+            const double HandleValue = NormY * DeltaValue;
+            OutSlope = static_cast<float>(HandleValue / HandleSec);
+            OutWeight = static_cast<float>(FMath::Sqrt(HandleSec * HandleSec + HandleValue * HandleValue));
+        };
+
         OutKey0 = FAnimationCoreKey{};
         OutKey0.Time = StartTime;
         OutKey0.Value = static_cast<float>(FromValue);
         OutKey0.Interp = TEXT("cubic");
-        OutKey0.LeaveTangent = (X1 != 0.0)
-            ? static_cast<float>((Y1 / X1) * DeltaValue / SafeDuration)
-            : 0.0f;
-        OutKey0.LeaveTangentWeight = static_cast<float>(FMath::Sqrt(X1 * X1 + Y1 * Y1) / 3.0);
+        ScaleHandle(X1, Y1, OutKey0.LeaveTangent, OutKey0.LeaveTangentWeight);
         OutKey0.ArriveTangent = 0.0f;
         OutKey0.ArriveTangentWeight = 0.0f;
         OutKey0.bHasWeights = true;
 
+        // Key 1's arrive handle points back from the end point: (1 - x2, 1 - y2).
         OutKey1 = FAnimationCoreKey{};
         OutKey1.Time = EndTime;
         OutKey1.Value = static_cast<float>(ToValue);
         OutKey1.Interp = TEXT("cubic");
-        OutKey1.ArriveTangent = (X2 != 1.0)
-            ? static_cast<float>(((1.0 - Y2) / (1.0 - X2)) * DeltaValue / SafeDuration)
-            : 0.0f;
-        OutKey1.ArriveTangentWeight = static_cast<float>(FMath::Sqrt((1.0 - X2) * (1.0 - X2) + (1.0 - Y2) * (1.0 - Y2)) / 3.0);
+        ScaleHandle(1.0 - X2, 1.0 - Y2, OutKey1.ArriveTangent, OutKey1.ArriveTangentWeight);
         OutKey1.LeaveTangent = 0.0f;
         OutKey1.LeaveTangentWeight = 0.0f;
         OutKey1.bHasWeights = true;
@@ -310,13 +493,21 @@ namespace MonolithUI
         return AnimationInternal::EnsurePossessableBinding(WidgetAnim, Scene, WidgetName, bIsRootWidget);
     }
 
+    int32 GetRenderTransformChannelIndex(const FString& PropertyPath)
+    {
+        return AnimationInternal::GetRenderTransformChannelIndex(PropertyPath);
+    }
+
     FMovieSceneFloatChannel* EnsureFloatTrackSectionChannel(
         UMovieScene* Scene,
         const FGuid& PossessableGuid,
         const FString& PropertyName,
-        const TRange<FFrameNumber>& SectionRange)
+        const TRange<FFrameNumber>& SectionRange,
+        bool bResetExistingKeys,
+        FString* OutMessage)
     {
-        return AnimationInternal::EnsureFloatTrackAndSection(Scene, PossessableGuid, PropertyName, SectionRange);
+        return AnimationInternal::EnsureFloatTrackAndSection(
+            Scene, PossessableGuid, PropertyName, SectionRange, bResetExistingKeys, OutMessage);
     }
 
     void InsertFloatChannelKey(
@@ -439,12 +630,18 @@ FMonolithActionResult MonolithUI::FAnimationCoreActions::HandleCreateAnimationV2
 
         TRange<FFrameNumber> SectionRange(StartFrame, EndFrame);
 
+        FString TrackMessage;
         FMovieSceneFloatChannel* Channel = EnsureFloatTrackAndSection(
-            Scene, PossessableGuid, PropertyName, SectionRange);
+            Scene, PossessableGuid, PropertyName, SectionRange, /*bResetExistingKeys=*/true, &TrackMessage);
         if (!Channel)
         {
             return FMonolithActionResult::Error(
-                FString::Printf(TEXT("Failed to create float track for '%s.%s'"), *WidgetName, *PropertyName), -32603);
+                FString::Printf(TEXT("tracks[%d] (%s.%s): %s"), TrackIdx, *WidgetName, *PropertyName,
+                    TrackMessage.IsEmpty() ? TEXT("failed to create track") : *TrackMessage), -32603);
+        }
+        if (!TrackMessage.IsEmpty())
+        {
+            Warnings.Add(FString::Printf(TEXT("tracks[%d] (%s): %s"), TrackIdx, *WidgetName, *TrackMessage));
         }
         ++TracksCreated;
 
@@ -593,6 +790,11 @@ FMonolithActionResult MonolithUI::FAnimationCoreActions::HandleAddBezierEasedSeg
     const double Y1 = (*BezierArr)[1]->AsNumber();
     const double X2 = (*BezierArr)[2]->AsNumber();
     const double Y2 = (*BezierArr)[3]->AsNumber();
+    // CSS requires x1, x2 in [0, 1]; outside it time would run backwards along the curve.
+    if (X1 < 0.0 || X1 > 1.0 || X2 < 0.0 || X2 > 1.0)
+    {
+        return FMonolithActionResult::Error(TEXT("bezier x1 and x2 must be in [0, 1] (CSS cubic-bezier rule)"), -32602);
+    }
 
     UWidgetBlueprint* WBP = LoadObject<UWidgetBlueprint>(nullptr, *AssetPath);
     if (!WBP)
@@ -636,40 +838,21 @@ FMonolithActionResult MonolithUI::FAnimationCoreActions::HandleAddBezierEasedSeg
     FGuid PossessableGuid = EnsurePossessableBinding(WidgetAnim, Scene, WidgetName, bIsRoot);
 
     TRange<FFrameNumber> SectionRange(TickRes.AsFrameNumber(StartTime), EndFrame);
+    FString TrackMessage;
     FMovieSceneFloatChannel* Channel = EnsureFloatTrackAndSection(
-        Scene, PossessableGuid, PropertyName, SectionRange);
+        Scene, PossessableGuid, PropertyName, SectionRange, /*bResetExistingKeys=*/true, &TrackMessage);
     if (!Channel)
     {
         return FMonolithActionResult::Error(
-            FString::Printf(TEXT("Failed to create float track for '%s.%s'"), *WidgetName, *PropertyName), -32603);
+            FString::Printf(TEXT("%s.%s: %s"), *WidgetName, *PropertyName,
+                TrackMessage.IsEmpty() ? TEXT("failed to create track") : *TrackMessage), -32603);
     }
 
-    // -- Bezier-to-tangent conversion --
-    const double DeltaValue = ToValue - FromValue;
-    const double DurationSec = EndTime - StartTime;
-
-    FParsedKey Key0;
-    Key0.Time = StartTime;
-    Key0.Value = static_cast<float>(FromValue);
-    Key0.Interp = TEXT("cubic");
-    Key0.LeaveTangent = (X1 != 0.0) ? static_cast<float>((Y1 / X1) * DeltaValue / DurationSec) : 0.0f;
-    Key0.LeaveTangentWeight = static_cast<float>(FMath::Sqrt(X1 * X1 + Y1 * Y1) / 3.0);
-    Key0.ArriveTangent = 0.0f;
-    Key0.ArriveTangentWeight = 0.0f;
-    Key0.bHasWeights = true;
-
-    FParsedKey Key1;
-    Key1.Time = EndTime;
-    Key1.Value = static_cast<float>(ToValue);
-    Key1.Interp = TEXT("cubic");
-    Key1.ArriveTangent = (X2 != 1.0) ? static_cast<float>(((1.0 - Y2) / (1.0 - X2)) * DeltaValue / DurationSec) : 0.0f;
-    Key1.ArriveTangentWeight = static_cast<float>(FMath::Sqrt((1.0 - X2) * (1.0 - X2) + (1.0 - Y2) * (1.0 - Y2)) / 3.0);
-    Key1.LeaveTangent = 0.0f;
-    Key1.LeaveTangentWeight = 0.0f;
-    Key1.bHasWeights = true;
-
-    InsertKey(Channel, TickRes, Key0);
-    InsertKey(Channel, TickRes, Key1);
+    // -- Bezier-to-tangent conversion (shared with the spec builder) --
+    FAnimationCoreKey Key0, Key1;
+    MonolithUI::ComputeBezierWeightedTangents(X1, Y1, X2, Y2, FromValue, ToValue, StartTime, EndTime, Key0, Key1);
+    MonolithUI::InsertFloatChannelKey(Channel, TickRes, Key0);
+    MonolithUI::InsertFloatChannelKey(Channel, TickRes, Key1);
 
     WBP->MarkPackageDirty();
 
@@ -679,6 +862,12 @@ FMonolithActionResult MonolithUI::FAnimationCoreActions::HandleAddBezierEasedSeg
     Result->SetStringField(TEXT("widget_name"), WidgetName);
     Result->SetStringField(TEXT("property"), PropertyName);
     Result->SetNumberField(TEXT("keys_inserted"), 2.0);
+    if (!TrackMessage.IsEmpty())
+    {
+        TArray<TSharedPtr<FJsonValue>> WarningsArr;
+        WarningsArr.Add(MakeShared<FJsonValueString>(TrackMessage));
+        Result->SetArrayField(TEXT("warnings"), WarningsArr);
+    }
 
     TSharedPtr<FJsonObject> TangentInfo = MakeShared<FJsonObject>();
     TangentInfo->SetNumberField(TEXT("key0_leave_tangent"), Key0.LeaveTangent);
@@ -848,12 +1037,14 @@ FMonolithActionResult MonolithUI::FAnimationCoreActions::HandleBakeSpringAnimati
     FGuid PossessableGuid = EnsurePossessableBinding(WidgetAnim, Scene, WidgetName, bIsRoot);
 
     TRange<FFrameNumber> SectionRange(StartFrame, EndFrame);
+    FString TrackMessage;
     FMovieSceneFloatChannel* Channel = EnsureFloatTrackAndSection(
-        Scene, PossessableGuid, PropertyName, SectionRange);
+        Scene, PossessableGuid, PropertyName, SectionRange, /*bResetExistingKeys=*/true, &TrackMessage);
     if (!Channel)
     {
         return FMonolithActionResult::Error(
-            FString::Printf(TEXT("Failed to create float track for '%s.%s'"), *WidgetName, *PropertyName), -32603);
+            FString::Printf(TEXT("%s.%s: %s"), *WidgetName, *PropertyName,
+                TrackMessage.IsEmpty() ? TEXT("failed to create track") : *TrackMessage), -32603);
     }
 
     for (const FParsedKey& Key : SpringKeys)
@@ -877,6 +1068,12 @@ FMonolithActionResult MonolithUI::FAnimationCoreActions::HandleBakeSpringAnimati
     Result->SetNumberField(TEXT("duration_actual"), FinalTime);
     Result->SetBoolField(TEXT("early_settled"), SettledFrames >= SettledThreshold);
     Result->SetBoolField(TEXT("compiled"), bCompileOnce);
+    if (!TrackMessage.IsEmpty())
+    {
+        TArray<TSharedPtr<FJsonValue>> WarningsArr;
+        WarningsArr.Add(MakeShared<FJsonValueString>(TrackMessage));
+        Result->SetArrayField(TEXT("warnings"), WarningsArr);
+    }
     return FMonolithActionResult::Success(Result);
 #else
     return FMonolithActionResult::Error(TEXT("Animation authoring requires editor (WITH_EDITORONLY_DATA)"), -32603);
@@ -894,7 +1091,11 @@ void MonolithUI::FAnimationCoreActions::Register(FMonolithToolRegistry& Registry
              "Params: asset_path (string, /Game/... WBP path), animation_name (string), duration_sec (number), "
              "tracks (array of { widget_name, property, keys: [{ time, value, interp?: 'cubic'|'linear'|'constant', "
              "arrive_tangent?, leave_tangent?, arrive_weight?, leave_weight? }] }), "
-             "compile_once (bool, optional, default true)."),
+             "compile_once (bool, optional, default true). "
+             "property is a UWidget property name such as RenderOpacity, or a render-transform channel: "
+             "RenderTransform.Translation.X|Y, RenderTransform.Scale.X|Y, RenderTransform.Shear.X|Y, RenderTransform.Angle "
+             "(keyed on the widget's 2D transform track, so the change shows on screen). "
+             "Tangents are slopes in value per second; weights are handle lengths in (seconds, value) space."),
         FMonolithActionHandler::CreateStatic(&MonolithUI::FAnimationCoreActions::HandleCreateAnimationV2));
 
     Registry.RegisterAction(
@@ -904,7 +1105,9 @@ void MonolithUI::FAnimationCoreActions::Register(FMonolithToolRegistry& Registry
              "Converts CSS cubic-bezier(x1,y1,x2,y2) control points into UE weighted tangents. "
              "Params: asset_path (string), animation_name (string), widget_name (string), property (string), "
              "from_value (number), to_value (number), start_time (number), end_time (number), "
-             "bezier (array of 4 numbers [x1, y1, x2, y2])."),
+             "bezier (array of 4 numbers [x1, y1, x2, y2], x1 and x2 in [0, 1]). "
+             "property accepts the same names as create_animation_v2, including RenderTransform channels. "
+             "tangent_info reports slopes in value per second and handle lengths in (seconds, value) space."),
         FMonolithActionHandler::CreateStatic(&MonolithUI::FAnimationCoreActions::HandleAddBezierEasedSegment));
 
     Registry.RegisterAction(
@@ -915,6 +1118,7 @@ void MonolithUI::FAnimationCoreActions::Register(FMonolithToolRegistry& Registry
              "Params: asset_path (string), animation_name (string), widget_name (string), property (string), "
              "from_value (number), to_value (number), stiffness (number, default 100), damping (number, default 10), "
              "mass (number, default 1), fps (number, optional, default 60), duration (number, optional, default 2.0), "
-             "compile_once (bool, optional, default true)."),
+             "compile_once (bool, optional, default true). "
+             "property accepts the same names as create_animation_v2, including RenderTransform channels."),
         FMonolithActionHandler::CreateStatic(&MonolithUI::FAnimationCoreActions::HandleBakeSpringAnimation));
 }

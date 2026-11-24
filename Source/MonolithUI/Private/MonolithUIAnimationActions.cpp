@@ -14,6 +14,7 @@
 #include "Channels/MovieSceneChannelProxy.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
+#include "Actions/Hoisted/AnimationCoreActions.h"
 
 namespace
 {
@@ -527,10 +528,9 @@ FMonolithActionResult FMonolithUIAnimationActions::HandleCreateAnimation(const T
             }
             else if (Property == TEXT("transform"))
             {
-                // Transform tracks use MovieScene3DTransformTrack for translation/rotation/scale
-                // For UMG we use float tracks on RenderTransform sub-properties
-                // Create separate float tracks for TranslationX, TranslationY, Angle, ScaleX, ScaleY
-
+                // UMG render transforms live on one UMovieScene2DTransformTrack bound to
+                // RenderTransform: it calls SetRenderTransform, so the widget moves on screen.
+                // Float tracks on RenderTransform.* sub-paths would only write the struct field.
                 FString SubProperties[] = {
                     TEXT("RenderTransform.Translation.X"),
                     TEXT("RenderTransform.Translation.Y"),
@@ -538,31 +538,14 @@ FMonolithActionResult FMonolithUIAnimationActions::HandleCreateAnimation(const T
                     TEXT("RenderTransform.Scale.X"),
                     TEXT("RenderTransform.Scale.Y")
                 };
-                FString SubPropertyNames[] = {
-                    TEXT("Translation X"), TEXT("Translation Y"),
-                    TEXT("Angle"),
-                    TEXT("Scale X"), TEXT("Scale Y")
-                };
 
                 // For transform, keyframes contain {time, tx, ty, angle, sx, sy}
-                // Create one float track per sub-property, each with matching keyframes
+                // Key one channel of the 2D transform section per sub-property
                 for (int32 SubIdx = 0; SubIdx < 5; ++SubIdx)
                 {
-                    UMovieSceneFloatTrack* FloatTrack = MovieScene->AddTrack<UMovieSceneFloatTrack>(PossessableGuid);
-                    if (!FloatTrack) continue;
-
-                    FloatTrack->SetPropertyNameAndPath(
-                        FName(*SubPropertyNames[SubIdx]), *SubProperties[SubIdx]);
-
-                    UMovieSceneFloatSection* Section = Cast<UMovieSceneFloatSection>(
-                        FloatTrack->CreateNewSection());
-                    if (!Section) continue;
-
-                    Section->SetRange(TRange<FFrameNumber>(StartFrame, EndFrame));
-                    FloatTrack->AddSection(*Section);
-
-                    FMovieSceneChannelProxy& ChannelProxy = Section->GetChannelProxy();
-                    FMovieSceneFloatChannel* Channel = ChannelProxy.GetChannel<FMovieSceneFloatChannel>(0);
+                    FMovieSceneFloatChannel* Channel = MonolithUI::EnsureFloatTrackSectionChannel(
+                        MovieScene, PossessableGuid, SubProperties[SubIdx],
+                        TRange<FFrameNumber>(StartFrame, EndFrame), /*bResetExistingKeys=*/false);
                     if (!Channel) continue;
 
                     const TArray<TSharedPtr<FJsonValue>>* KeyframesArray = nullptr;
@@ -830,55 +813,74 @@ FMonolithActionResult FMonolithUIAnimationActions::HandleAddAnimationKeyframe(co
             FString::Printf(TEXT("Unable to create animation binding for widget '%s'"), *WidgetName));
     }
 
-    UMovieSceneFloatTrack* FloatTrack = FindOrCreateFloatTrack(
-        MovieScene,
-        PossessableGuid,
-        TrackPropertyName,
-        PropertyPath,
-        StartFrame,
-        EndFrame);
-    if (!FloatTrack)
+    FMovieSceneFloatChannel* Channel = nullptr;
+    if (MonolithUI::GetRenderTransformChannelIndex(PropertyPath) != INDEX_NONE)
     {
-        return FMonolithActionResult::Error(
-            FString::Printf(TEXT("Unable to create %s track for widget '%s'"), *PropertyPath, *WidgetName));
-    }
-
-    for (UMovieSceneSection* Section : FloatTrack->GetAllSections())
-    {
-        FMovieSceneChannelProxy& ChannelProxy = Section->GetChannelProxy();
-        FMovieSceneFloatChannel* Channel = ChannelProxy.GetChannel<FMovieSceneFloatChannel>(0);
+        // Render-transform components are keyed on the 2D transform track (see create_animation).
+        FString TrackMessage;
+        Channel = MonolithUI::EnsureFloatTrackSectionChannel(
+            MovieScene, PossessableGuid, PropertyPath, TRange<FFrameNumber>(StartFrame, EndFrame),
+            /*bResetExistingKeys=*/false, &TrackMessage);
         if (!Channel)
         {
-            continue;
+            return FMonolithActionResult::Error(
+                FString::Printf(TEXT("Unable to create %s track for widget '%s': %s"), *PropertyPath, *WidgetName, *TrackMessage));
         }
-
-        Channel->AddLinearKey(KeyFrame, static_cast<float>(Value));
-
-        FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WBP);
-        FKismetEditorUtilities::CompileBlueprint(WBP);
-
-        TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
-        Result->SetStringField(TEXT("asset_path"), AssetPath);
-        Result->SetStringField(TEXT("animation_name"), AnimationName);
-        Result->SetStringField(TEXT("widget_name"), WidgetName);
-        Result->SetStringField(TEXT("property"), Property);
-        if (!Component.IsEmpty())
+    }
+    else
+    {
+        UMovieSceneFloatTrack* FloatTrack = FindOrCreateFloatTrack(
+            MovieScene,
+            PossessableGuid,
+            TrackPropertyName,
+            PropertyPath,
+            StartFrame,
+            EndFrame);
+        if (!FloatTrack)
         {
-            Result->SetStringField(TEXT("component"), Component);
+            return FMonolithActionResult::Error(
+                FString::Printf(TEXT("Unable to create %s track for widget '%s'"), *PropertyPath, *WidgetName));
         }
-        Result->SetNumberField(TEXT("time"), Time);
-        Result->SetNumberField(TEXT("value"), Value);
-        Result->SetBoolField(TEXT("binding_created"), true);
-        Result->SetBoolField(TEXT("track_created"), true);
-        Result->SetBoolField(TEXT("added"), true);
-        // Phase L deprecation hint -- v1 surface scheduled for removal one major release out.
-        Result->SetBoolField(TEXT("deprecated"), true);
-        Result->SetStringField(TEXT("use_action"), TEXT("ui::create_animation_v2"));
-        return FMonolithActionResult::Success(Result);
+
+        for (UMovieSceneSection* Section : FloatTrack->GetAllSections())
+        {
+            Channel = Section->GetChannelProxy().GetChannel<FMovieSceneFloatChannel>(0);
+            if (Channel)
+            {
+                break;
+            }
+        }
     }
 
-    return FMonolithActionResult::Error(
-        FString::Printf(TEXT("No section channel found for property '%s' on widget '%s'"), *Property, *WidgetName));
+    if (!Channel)
+    {
+        return FMonolithActionResult::Error(
+            FString::Printf(TEXT("No section channel found for property '%s' on widget '%s'"), *Property, *WidgetName));
+    }
+
+    Channel->AddLinearKey(KeyFrame, static_cast<float>(Value));
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WBP);
+    FKismetEditorUtilities::CompileBlueprint(WBP);
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("asset_path"), AssetPath);
+    Result->SetStringField(TEXT("animation_name"), AnimationName);
+    Result->SetStringField(TEXT("widget_name"), WidgetName);
+    Result->SetStringField(TEXT("property"), Property);
+    if (!Component.IsEmpty())
+    {
+        Result->SetStringField(TEXT("component"), Component);
+    }
+    Result->SetNumberField(TEXT("time"), Time);
+    Result->SetNumberField(TEXT("value"), Value);
+    Result->SetBoolField(TEXT("binding_created"), true);
+    Result->SetBoolField(TEXT("track_created"), true);
+    Result->SetBoolField(TEXT("added"), true);
+    // Phase L deprecation hint -- v1 surface scheduled for removal one major release out.
+    Result->SetBoolField(TEXT("deprecated"), true);
+    Result->SetStringField(TEXT("use_action"), TEXT("ui::create_animation_v2"));
+    return FMonolithActionResult::Success(Result);
 }
 
 // --- remove_animation ---
