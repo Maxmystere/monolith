@@ -5,6 +5,7 @@
 #include "MonolithPieInputActions.h"
 #include "MonolithPieTimeseries.h"
 #include "MonolithStatActions.h"
+#include "MonolithEditorAssetActions.h"
 #include "MonolithSettingsCustomization.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithJsonUtils.h"
@@ -100,6 +101,8 @@ void FMonolithEditorModule::StartupModule()
 	FMonolithPieInputActions::RegisterPieEndHook();
 	// Gap 10: programmatic stat-group counter/cycle readout (#if STATS gated).
 	FMonolithStatActions::RegisterActions(FMonolithToolRegistry::Get());
+	// Generic asset operations (duplicate_asset).
+	FMonolithEditorAssetActions::RegisterActions(FMonolithToolRegistry::Get());
 
 	// Register settings detail customization
 	FPropertyEditorModule& PropModule = FModuleManager::LoadModuleChecked<FPropertyEditorModule>("PropertyEditor");
