@@ -2,6 +2,7 @@
 #include "MonolithJsonUtils.h"
 #include "MonolithParamSchema.h"
 #include "MonolithFuzzyMatch.h"
+#include "MonolithNameSuggest.h"
 #include "HAL/PlatformMisc.h"
 #include "Dom/JsonValue.h"
 #include "Serialization/JsonReader.h"
@@ -74,6 +75,27 @@ bool FMonolithParamSchema::ApplyAliases(
 	return true;
 }
 
+namespace MonolithParamSuggest
+{
+	/** Keys accepted on every action, whatever its schema. */
+	static const TCHAR* const UniversalKeys[] = {
+		// Survivor B (plan §3.B) - universal response-shaping params, consumed by the
+		// post-filter at the bottom of ExecuteAction.
+		TEXT("_fields"),
+		TEXT("_omit"),
+		TEXT("_compact_json"),
+		// Phase 1.1 (RI ergonomics handover #3) - nested-payload shaping params.
+		// `_row_fields` filters each row of the unique top-level list payload;
+		// `_path_fields` retains only matching dotted leaves.
+		TEXT("_row_fields"),
+		TEXT("_path_fields"),
+		// Per-call strict mode: turns unknown params into an error for this call only
+		// (the STRICT_PARAMS env var does the same for every call). Consumed and removed
+		// by ExecuteAction before the handler runs.
+		TEXT("_strict"),
+	};
+}
+
 TArray<FString> FMonolithParamSchema::FindUnknownKeys(
 	const TSharedPtr<FJsonObject>& Schema,
 	const TSharedPtr<FJsonObject>& Params)
@@ -112,19 +134,11 @@ TArray<FString> FMonolithParamSchema::FindUnknownKeys(
 	// Legacy wbp_path/asset_path back-compat: allow asset_path everywhere.
 	Allowed.Add(TEXT("asset_path"));
 
-	// Survivor B (plan §3.B) — universal response-shaping params. Allow these
-	// on EVERY action so the K3 STRICT_PARAMS=1 path does not hard-fail on
-	// `_fields` / `_omit` / `_compact_json`. The post-filter at the bottom
-	// of ExecuteAction consumes + acts on them.
-	Allowed.Add(TEXT("_fields"));
-	Allowed.Add(TEXT("_omit"));
-	Allowed.Add(TEXT("_compact_json"));
-	// Phase 1.1 (RI ergonomics handover #3) — nested-payload shaping params.
-	// `_row_fields` filters each row of the unique top-level list payload;
-	// `_path_fields` retains only matching dotted leaves. Same allowlist
-	// treatment as the original three.
-	Allowed.Add(TEXT("_row_fields"));
-	Allowed.Add(TEXT("_path_fields"));
+	// Allowed on EVERY action, so K3 (and strict mode) never flags them.
+	for (const TCHAR* Key : MonolithParamSuggest::UniversalKeys)
+	{
+		Allowed.Add(Key);
+	}
 
 	for (const auto& Pair : Params->Values)
 	{
@@ -142,6 +156,81 @@ bool FMonolithParamSchema::IsStrictParamsEnabled()
 {
 	const FString Val = FPlatformMisc::GetEnvironmentVariable(TEXT("STRICT_PARAMS"));
 	return Val == TEXT("1");
+}
+
+namespace MonolithParamSuggest
+{
+	static TArray<FString> AliasesOf(const TSharedPtr<FJsonValue>& ParamDefValue)
+	{
+		TArray<FString> Out;
+		const TSharedPtr<FJsonObject>* ParamDef = nullptr;
+		if (ParamDefValue->TryGetObject(ParamDef) && ParamDef)
+		{
+			(*ParamDef)->TryGetStringArrayField(TEXT("aliases"), Out);
+		}
+		return Out;
+	}
+
+	/**
+	 * What an unknown key could have meant: the schema params the caller has not supplied,
+	 * with their aliases, then the universal keys not supplied.
+	 */
+	static TArray<FString> UnusedSchemaNames(const TSharedPtr<FJsonObject>& Schema, const TSharedPtr<FJsonObject>& Params)
+	{
+		TArray<FString> Out;
+		if (!Schema.IsValid())
+		{
+			return Out;
+		}
+		for (const auto& Pair : Schema->Values)
+		{
+			const FString Canonical = MonolithKeyToString(Pair.Key);
+			// A supplied param (directly, or through an alias the K2 rewrite moved onto it)
+			// takes its aliases with it: suggesting one would end in a collision error.
+			if (Params->HasField(Canonical))
+			{
+				continue;
+			}
+			Out.Add(Canonical);
+			Out.Append(AliasesOf(Pair.Value));
+		}
+		for (const TCHAR* Key : UniversalKeys)
+		{
+			if (!Params->HasField(Key))
+			{
+				Out.Add(Key);
+			}
+		}
+		return Out;
+	}
+
+	/** The schema param a name sets: itself when canonical, its owner when an alias, empty for a universal key. */
+	static FString CanonicalName(const TSharedPtr<FJsonObject>& Schema, const FString& Name)
+	{
+		for (const auto& Pair : Schema->Values)
+		{
+			const FString Canonical = MonolithKeyToString(Pair.Key);
+			if (Canonical == Name || AliasesOf(Pair.Value).Contains(Name))
+			{
+				return Canonical;
+			}
+		}
+		return FString();
+	}
+
+	/** The closest unused name for an unknown key, or empty. */
+	static FString ForUnknownKey(const FString& Key, const TArray<FString>& UnusedNames)
+	{
+		const TArray<FString> Best = MonolithNameSuggest::Closest(Key, UnusedNames, 1);
+		return Best.Num() > 0 ? Best[0] : FString();
+	}
+
+	/** `_strict` as FJsonValue::TryGetBool reads it: true, "true" / "1", a non-zero number. */
+	static bool IsStrictCall(const TSharedPtr<FJsonObject>& Params)
+	{
+		bool bStrict = false;
+		return Params->TryGetBoolField(TEXT("_strict"), bStrict) && bStrict;
+	}
 }
 
 // =============================================================================
@@ -398,6 +487,7 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 		};
 
 		TArray<FString> Missing;
+		TArray<FString> MissingNames; // undecorated, for pairing with unknown keys below
 		for (const auto& Pair : ActionInfo.ParamSchema->Values)
 		{
 			const FString PairKeyStr = MonolithKeyToString(Pair.Key);
@@ -444,11 +534,13 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 						{
 							Missing.Add(FString::Printf(TEXT("asset_path (or alias: %s)"),
 								*FString::Join(AcceptedAliases, TEXT(", "))));
+							MissingNames.Add(PairKeyStr);
 							continue;
 						}
 					}
 
 					Missing.Add(PairKeyStr);
+					MissingNames.Add(PairKeyStr);
 				}
 			}
 		}
@@ -456,11 +548,60 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 		{
 			TArray<FString> Provided;
 			for (const auto& P : EffectiveParams->Values) Provided.Add(MonolithKeyToString(P.Key));
-			return FMonolithActionResult::Error(
-				FString::Printf(TEXT("Missing required param(s): [%s]. Provided keys: [%s] — inspect the action's parameter schema via monolith_discover(\"<namespace>\") and supply all required fields."),
+
+			// Link the keys the schema doesn't know to the params that are missing: a close
+			// name, or -- when exactly one param is missing and exactly one key is unknown --
+			// that pair. run_python given 'code' then reads "Did you mean to pass 'code' as 'command'?".
+			TArray<FString> UnknownGiven = FMonolithParamSchema::FindUnknownKeys(ActionInfo.ParamSchema, EffectiveParams);
+			const TArray<FString> UnusedNames = MonolithParamSuggest::UnusedSchemaNames(ActionInfo.ParamSchema, EffectiveParams);
+			TArray<FString> Hints;
+			TArray<TSharedPtr<FJsonValue>> SuggestionValues;
+			for (const FString& Name : MissingNames)
+			{
+				const TArray<FString> Close = MonolithNameSuggest::Closest(Name, UnknownGiven, 1);
+				FString Given = Close.Num() > 0 ? Close[0] : FString();
+				if (Given.IsEmpty() && MissingNames.Num() == 1 && UnknownGiven.Num() == 1)
+				{
+					Given = UnknownGiven[0];
+				}
+				// A key whose closest name is another param (an optional one, a universal key)
+				// is a typo of that one, not this missing param under a wrong name.
+				if (!Given.IsEmpty())
+				{
+					const FString Meant = MonolithParamSuggest::ForUnknownKey(Given, UnusedNames);
+					if (!Meant.IsEmpty() && MonolithParamSuggest::CanonicalName(ActionInfo.ParamSchema, Meant) != Name)
+					{
+						Given.Reset();
+					}
+				}
+				if (Given.IsEmpty())
+				{
+					continue;
+				}
+				UnknownGiven.Remove(Given);
+				Hints.Add(FString::Printf(TEXT("'%s' as '%s'"), *Given, *Name));
+				TSharedPtr<FJsonObject> Suggestion = MakeShared<FJsonObject>();
+				Suggestion->SetStringField(TEXT("given"), Given);
+				Suggestion->SetStringField(TEXT("param"), Name);
+				SuggestionValues.Add(MakeShared<FJsonValueObject>(Suggestion));
+			}
+			const FString HintText = Hints.Num() > 0
+				? FString::Printf(TEXT(" Did you mean to pass %s?"), *FString::Join(Hints, TEXT(", ")))
+				: FString();
+
+			FMonolithActionResult MissingError = FMonolithActionResult::Error(
+				FString::Printf(TEXT("Missing required param(s): [%s]. Provided keys: [%s].%s Inspect the action's parameter schema via monolith_discover(\"<namespace>\") and supply all required fields."),
 					*FString::Join(Missing, TEXT(", ")),
-					*FString::Join(Provided, TEXT(", "))),
+					*FString::Join(Provided, TEXT(", ")),
+					*HintText),
 				FMonolithJsonUtils::ErrInvalidParams);
+			if (SuggestionValues.Num() > 0)
+			{
+				TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+				Data->SetArrayField(TEXT("suggestions"), SuggestionValues);
+				MissingError.WithErrorData(Data);
+			}
+			return MissingError;
 		}
 	}
 
@@ -530,29 +671,53 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 	}
 
 	// K3 — unknown-key detection (after required-check, before dispatch).
+	// Each unknown key carries the closest unused schema name, when one is close enough.
 	TArray<FString> Unknown;
+	TArray<FString> UnknownMessages;
+	const bool bStrictCall = MonolithParamSuggest::IsStrictCall(EffectiveParams);
 	if (ActionInfo.ParamSchema.IsValid())
 	{
 		Unknown = FMonolithParamSchema::FindUnknownKeys(ActionInfo.ParamSchema, EffectiveParams);
 
 		if (Unknown.Num() > 0)
 		{
+			const TArray<FString> UnusedNames = MonolithParamSuggest::UnusedSchemaNames(ActionInfo.ParamSchema, EffectiveParams);
+			TArray<TSharedPtr<FJsonValue>> SuggestionValues;
+			TArray<FString> StrictParts;
 			for (const FString& K : Unknown)
 			{
+				const FString Suggestion = MonolithParamSuggest::ForUnknownKey(K, UnusedNames);
+				const FString Suffix = Suggestion.IsEmpty() ? FString() : MonolithNameSuggest::DidYouMeanSuffix({ Suggestion });
+				UnknownMessages.Add(FString::Printf(TEXT("Unknown param '%s' for action '%s:%s'%s"), *K, *Namespace, *Action, *Suffix));
+				StrictParts.Add(Suggestion.IsEmpty() ? K : FString::Printf(TEXT("%s (did you mean '%s'?)"), *K, *Suggestion));
 				UE_LOG(LogMonolith, Warning,
-					TEXT("Unknown param '%s' for action '%s:%s' (typo? not in schema)"),
-					*K, *Namespace, *Action);
+					TEXT("Unknown param '%s' for action '%s:%s' (typo? not in schema)%s"),
+					*K, *Namespace, *Action, *Suffix);
+
+				TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+				Entry->SetStringField(TEXT("given"), K);
+				if (!Suggestion.IsEmpty())
+				{
+					Entry->SetStringField(TEXT("param"), Suggestion);
+				}
+				SuggestionValues.Add(MakeShared<FJsonValueObject>(Entry));
 			}
 
-			if (FMonolithParamSchema::IsStrictParamsEnabled())
+			if (bStrictCall || FMonolithParamSchema::IsStrictParamsEnabled())
 			{
+				TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+				Data->SetArrayField(TEXT("unknown_params"), SuggestionValues);
 				return FMonolithActionResult::Error(
-					FString::Printf(TEXT("STRICT_PARAMS=1: rejected action '%s:%s' due to unknown params: [%s] — unset STRICT_PARAMS or remove the unknown params from the call."),
-						*Namespace, *Action, *FString::Join(Unknown, TEXT(", "))),
-					FMonolithJsonUtils::ErrInvalidParams);
+					FString::Printf(TEXT("%s: rejected action '%s:%s' due to unknown params: [%s] — %s"),
+						bStrictCall ? TEXT("_strict") : TEXT("STRICT_PARAMS=1"),
+						*Namespace, *Action, *FString::Join(StrictParts, TEXT(", ")),
+						bStrictCall ? TEXT("fix or remove the unknown params, or drop _strict.")
+						            : TEXT("unset STRICT_PARAMS or remove the unknown params from the call.")),
+					FMonolithJsonUtils::ErrInvalidParams).WithErrorData(Data);
 			}
 		}
 	}
+	EffectiveParams->RemoveField(TEXT("_strict"));
 
 	// Release lock before executing handler (handlers may take time)
 	FMonolithActionHandler HandlerCopy = RegAction->Handler;
@@ -569,10 +734,7 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 	{
 		TArray<FString> AllWarnings;
 		AllWarnings.Append(PathParamWarnings);
-		for (const FString& K : Unknown)
-		{
-			AllWarnings.Add(FString::Printf(TEXT("Unknown param '%s' for action '%s:%s'"), *K, *Namespace, *Action));
-		}
+		AllWarnings.Append(UnknownMessages);
 
 		// Survivor B post-filter — mutates ActionResult.Result in-place and may
 		// append its own warnings (e.g., mutually-exclusive _fields + _omit).

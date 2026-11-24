@@ -77,6 +77,12 @@ public:
 	static bool IsDeprecatedProperty(const FProperty* Prop, FString& OutReason);
 
 	/**
+	 * "unknown field 'Name' on Struct", plus " — did you mean 'A', 'B'?" with the closest
+	 * field names on Struct when any are close enough (MonolithNameSuggest).
+	 */
+	static FString UnknownFieldMessage(const UStruct* Struct, const FString& Name);
+
+	/**
 	 * Result of resolving a dotted+bracket property path down to a single leaf.
 	 *
 	 * On success: LeafProp + LeafPtr address exactly the value to overwrite, and
