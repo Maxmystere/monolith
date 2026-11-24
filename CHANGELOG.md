@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`ui move_widget` can reorder within a panel.** New optional `index`: the widget's 0-based position among the destination's children after the move (clamped; `-1` or omitted = last). `new_parent_name` is now optional; omit it to reorder in place, which keeps the slot and its layout properties (`slot_preserved` in the result). The result adds `old_index` and `index`. Automation test `MonolithUI.MoveWidget.IndexAndGuards`.
+
+### Fixed
+
+- **`ui move_widget` no longer orphans or loops widgets.** Moving into a single-child panel that already had its child removed the widget from its old parent and then failed to add it; moving a widget into one of its own descendants, or moving the root, was not refused. All three are now refused before anything is detached.
+
 ## [0.25.0] - 2026-11-20
 
 > **Action count is approximate.** **~1,500+ actions across 27 in-tree namespaces** - query `monolith_discover()` for the live figure.

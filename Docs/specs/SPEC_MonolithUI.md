@@ -100,7 +100,7 @@ Counts re-verified against `RegisterAction(TEXT("ui"), ...)` call sites on 2026-
 |--------|--------|-------------|
 | `set_slot_property` | `asset_path`, `widget_name`, `property_name`, `value` | Set a layout slot property (padding, alignment, size, etc.). As of v0.21.0 (#74) grid slots are supported — `row`, `column`, `row_span`, `column_span` on `UUniformGridSlot` and `UGridSlot`. |
 | `set_anchor_preset` | `asset_path`, `widget_name`, `preset` | Apply an anchor preset to a Canvas Panel slot |
-| `move_widget` | `asset_path`, `widget_name`, `new_parent`, `slot_index` | Move a widget to a different parent slot |
+| `move_widget` | `asset_path`, `widget_name`, `new_parent_name?`, `index?`, `compile?` | Move a widget to another parent panel, to another position among its siblings, or both (at least one of `new_parent_name` / `index`). `index` is the 0-based position after the move, clamped to last; `-1` or omitted = last. Reordering within the same parent keeps the slot and its layout properties (`slot_preserved: true`); another parent gives a new slot of that panel's type. Refuses the root widget, the widget's own descendants, and a single-child panel that is already full, before detaching anything. Response: `old_parent`, `old_index`, `new_parent`, `index`, `new_slot_type`, `slot_preserved`, `compiled`. |
 
 **Templates (8)**
 | Action | Params | Description |

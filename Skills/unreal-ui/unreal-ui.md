@@ -32,7 +32,7 @@ description: Use when working with Unreal Engine UI via Monolith MCP — creatin
 | **Slot & Layout (3)** | | |
 | `set_slot_property` | `asset_path`, `widget_name`, `anchors`?, `offsets`?, `position`?, `size`?, `z_order`?, `padding`? | Any slot property |
 | `set_anchor_preset` | `asset_path`, `widget_name`, `preset` | Named anchor preset |
-| `move_widget` | `asset_path`, `widget_name`, `new_parent_name` | Reparent widget |
+| `move_widget` | `asset_path`, `widget_name`, `new_parent_name`?, `index`? | Reparent and/or reorder (index = position after the move; omit new_parent_name to reorder in place, keeping the slot) |
 | **Templates (8)** | | |
 | `create_hud_element` | `asset_path`, `element_type` | crosshair, health_bar, ammo_counter, stamina_bar, interaction_prompt, damage_indicator, compass, subtitles, flashlight_battery |
 | `create_menu` | `save_path`, `menu_type`, `buttons`? | main_menu, pause_menu, death_screen, credits |
