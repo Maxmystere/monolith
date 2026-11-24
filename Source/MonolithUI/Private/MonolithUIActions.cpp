@@ -60,7 +60,7 @@ void FMonolithUIActions::RegisterActions(FMonolithToolRegistry& Registry)
         FParamSchemaBuilder()
             .RequiredAssetPath(TEXT("save_path"), TEXT("Asset path, e.g. /Game/UI/WBP_MyWidget"))
             .Optional(TEXT("parent_class"), TEXT("string"), TEXT("Parent class name (default: UserWidget, or EditorUtilityWidget when editor_utility=true)"), TEXT("UserWidget"))
-            .Optional(TEXT("root_widget"), TEXT("string"), TEXT("Root widget type (default: CanvasPanel)"), TEXT("CanvasPanel"))
+            .Optional(TEXT("root_widget"), TEXT("string"), TEXT("Root panel class (e.g. CanvasPanel, Overlay, VerticalBox, SafeZone). Overrides the project's UMG Default Root Widget setting. Omitted: the project's default root, or CanvasPanel when the project sets none. The result's root_widget / root_widget_name report the root actually created"))
             .Optional(TEXT("editor_utility"), TEXT("boolean"), TEXT("Create an Editor Utility Widget Blueprint (parent must derive from EditorUtilityWidget). Default: false, or true when parent_class is an EditorUtilityWidget subclass."), TEXT("false"))
             .Optional(TEXT("skip_save"), TEXT("boolean"), TEXT("Skip saving to disk"), TEXT("false"))
             .Build()
@@ -198,8 +198,24 @@ FMonolithActionResult FMonolithUIActions::HandleCreateWidgetBlueprint(const TSha
     FString ParentClassName = MonolithUIInternal::GetOptionalString(Params, TEXT("parent_class"));
     if (ParentClassName.IsEmpty()) ParentClassName = bEditorUtility ? TEXT("EditorUtilityWidget") : TEXT("UserWidget");
 
-    FString RootWidgetType = MonolithUIInternal::GetOptionalString(Params, TEXT("root_widget"));
-    if (RootWidgetType.IsEmpty()) RootWidgetType = TEXT("CanvasPanel");
+    // root_widget, when given, must name a panel class and always wins. When omitted,
+    // the root the factory builds from the project's UMG settings is kept, and
+    // CanvasPanel is used only if that leaves the tree empty.
+    const FString RootWidgetType = MonolithUIInternal::GetOptionalString(Params, TEXT("root_widget"));
+    UClass* RequestedRootClass = nullptr;
+    if (!RootWidgetType.IsEmpty())
+    {
+        RequestedRootClass = MonolithUIInternal::WidgetClassFromName(RootWidgetType);
+        if (!RequestedRootClass || !RequestedRootClass->IsChildOf(UPanelWidget::StaticClass()))
+        {
+            return MonolithUIInternal::MakeErrorFromSpecError(MonolithUIInternal::MakeSpecError(
+                TEXT("Type"),
+                TEXT("/root_widget"),
+                FString::Printf(TEXT("root_widget '%s' is not a panel widget class."), *RootWidgetType),
+                TEXT("Use a panel type such as CanvasPanel, Overlay, VerticalBox, HorizontalBox, SizeBox, Border, SafeZone or ScaleBox."),
+                { TEXT("CanvasPanel"), TEXT("Overlay"), TEXT("VerticalBox"), TEXT("HorizontalBox"), TEXT("SizeBox"), TEXT("Border"), TEXT("SafeZone"), TEXT("ScaleBox") }));
+        }
+    }
 
     const bool bSkipSave = MonolithUIInternal::GetOptionalBool(Params, TEXT("skip_save"), false);
 
@@ -328,17 +344,28 @@ FMonolithActionResult FMonolithUIActions::HandleCreateWidgetBlueprint(const TSha
         }
     }
 
-    // Set root widget if tree is empty
-    if (WBP->WidgetTree && !WBP->WidgetTree->RootWidget)
+    // UWidgetBlueprintFactory builds the project's default root (Project Settings >
+    // UMG Editor > Default Root Widget) before we get here. Replace it when the caller
+    // asked for another class; it is empty, since the asset was just created.
+    UWidgetTree* Tree = WBP->WidgetTree;
+    if (Tree && RequestedRootClass && Tree->RootWidget && Tree->RootWidget->GetClass() != RequestedRootClass)
     {
-        UClass* RootClass = MonolithUIInternal::WidgetClassFromName(RootWidgetType);
-        if (RootClass && RootClass->IsChildOf(UPanelWidget::StaticClass()))
-        {
-            UWidget* Root = WBP->WidgetTree->ConstructWidget<UWidget>(RootClass, FName(*RootWidgetType));
-            WBP->WidgetTree->RootWidget = Root;
-            MonolithUIInternal::RegisterCreatedWidget(WBP, Root);
-        }
+        UWidget* DefaultRoot = Tree->RootWidget;
+        const FName DefaultRootName = DefaultRoot->GetFName();
+        Tree->RemoveWidget(DefaultRoot);
+        WBP->OnVariableRemoved(DefaultRootName);
+        // Move it out of the tree's outer chain so the compiler's widget walk skips it.
+        DefaultRoot->Rename(nullptr, GetTransientPackage(), REN_DoNotDirty | REN_DontCreateRedirectors);
     }
+
+    if (Tree && !Tree->RootWidget)
+    {
+        UClass* RootClass = RequestedRootClass ? RequestedRootClass : UCanvasPanel::StaticClass();
+        UWidget* Root = Tree->ConstructWidget<UWidget>(RootClass, RootClass->GetFName());
+        Tree->RootWidget = Root;
+        MonolithUIInternal::RegisterCreatedWidget(WBP, Root);
+    }
+    const UWidget* FinalRoot = Tree ? Tree->RootWidget.Get() : nullptr;
 
     // Compile
     MonolithUIInternal::ReconcileWidgetVariableGuids(WBP);
@@ -360,7 +387,8 @@ FMonolithActionResult FMonolithUIActions::HandleCreateWidgetBlueprint(const TSha
     Result->SetStringField(TEXT("parent_class"), ParentClass->GetName());
     Result->SetStringField(TEXT("asset_class"), WBP->GetClass()->GetName());
     Result->SetBoolField(TEXT("editor_utility"), bEditorUtility);
-    Result->SetStringField(TEXT("root_widget"), RootWidgetType);
+    Result->SetStringField(TEXT("root_widget"), FinalRoot ? FinalRoot->GetClass()->GetName() : TEXT("none"));
+    Result->SetStringField(TEXT("root_widget_name"), FinalRoot ? FinalRoot->GetName() : TEXT("none"));
     Result->SetBoolField(TEXT("compiled"), true);
     Result->SetBoolField(TEXT("saved"), !bSkipSave);
 

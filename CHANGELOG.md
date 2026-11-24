@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ui create_widget_blueprint` honours `root_widget`.** `UWidgetBlueprintFactory` builds the root from Project Settings > UMG Editor > Default Root Widget, and the action only added its own root to an empty tree, so in a project whose default is (say) SafeZone, asking for `Overlay` returned a `SafeZone_0` root while the result claimed the requested type. An explicit `root_widget` now replaces the project default; omitted, the project default is kept (`CanvasPanel` when there is none). The result's `root_widget` is now the class of the root actually created, plus a new `root_widget_name`. A `root_widget` that is not a panel class, previously ignored silently, is now a `Type` error. Automation test `MonolithUI.CreateWidgetBlueprint.RootWidget`.
+
 ## [0.25.0] - 2026-11-20
 
 > **Action count is approximate.** **~1,500+ actions across 27 in-tree namespaces** - query `monolith_discover()` for the live figure.
