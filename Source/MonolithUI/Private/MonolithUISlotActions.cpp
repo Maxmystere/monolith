@@ -46,12 +46,15 @@ void FMonolithUISlotActions::RegisterActions(FMonolithToolRegistry& Registry)
 
     Registry.RegisterAction(
         TEXT("ui"), TEXT("move_widget"),
-        TEXT("Move a widget to a different parent panel"),
+        TEXT("Move a widget to another parent panel, to another position among its siblings, or both. "
+             "Pass new_parent_name, index, or both. Reordering within the same parent keeps the slot and its layout "
+             "properties; moving to another parent gives the widget a new slot of that panel's type."),
         FMonolithActionHandler::CreateStatic(&HandleMoveWidget),
         FParamSchemaBuilder()
             .RequiredAssetPath(TEXT("asset_path"), TEXT("Widget Blueprint asset path"))
             .Required(TEXT("widget_name"), TEXT("string"), TEXT("Widget to move"))
-            .Required(TEXT("new_parent_name"), TEXT("string"), TEXT("New parent panel name"))
+            .Optional(TEXT("new_parent_name"), TEXT("string"), TEXT("Destination panel name. Omit to reorder within the current parent"))
+            .Optional(TEXT("index"), TEXT("number"), TEXT("0-based position among the destination panel's children after the move; larger values clamp to last. -1 or omit = last"))
             .Optional(TEXT("compile"), TEXT("boolean"), TEXT("Compile after moving"), TEXT("true"))
             .Build()
     );
@@ -342,7 +345,24 @@ FMonolithActionResult FMonolithUISlotActions::HandleMoveWidget(const TSharedPtr<
 {
     FString AssetPath = Params->GetStringField(TEXT("asset_path"));
     FString WidgetName = Params->GetStringField(TEXT("widget_name"));
-    FString NewParentName = Params->GetStringField(TEXT("new_parent_name"));
+    FString NewParentName;
+    Params->TryGetStringField(TEXT("new_parent_name"), NewParentName);
+
+    // index: final 0-based position among the destination's children; -1 / omitted = last.
+    int32 RequestedIndex = INDEX_NONE;
+    if (Params->HasField(TEXT("index")))
+    {
+        double IndexValue = 0.0;
+        if (!Params->TryGetNumberField(TEXT("index"), IndexValue) || IndexValue < -1.0 || IndexValue != FMath::FloorToDouble(IndexValue))
+        {
+            return FMonolithActionResult::Error(TEXT("index must be an integer >= 0, or -1 for last"), -32602);
+        }
+        RequestedIndex = static_cast<int32>(IndexValue);
+    }
+    if (NewParentName.IsEmpty() && !Params->HasField(TEXT("index")))
+    {
+        return FMonolithActionResult::Error(TEXT("Pass new_parent_name, index, or both"), -32602);
+    }
 
     FMonolithActionResult Err;
     UWidgetBlueprint* WBP = MonolithUIInternal::LoadWidgetBlueprint(AssetPath, Err);
@@ -354,25 +374,70 @@ FMonolithActionResult FMonolithUISlotActions::HandleMoveWidget(const TSharedPtr<
         return FMonolithActionResult::Error(
             FString::Printf(TEXT("Widget '%s' not found"), *WidgetName));
     }
-
-    UWidget* NewParentWidget = WBP->WidgetTree->FindWidget(FName(*NewParentName));
-    UPanelWidget* NewParent = Cast<UPanelWidget>(NewParentWidget);
-    if (!NewParent)
+    if (Widget == WBP->WidgetTree->RootWidget)
     {
         return FMonolithActionResult::Error(
-            FString::Printf(TEXT("New parent '%s' not found or not a panel"), *NewParentName));
+            FString::Printf(TEXT("'%s' is the root widget and has no parent panel to move within"), *WidgetName));
     }
 
-    // Remove from current parent
-    int32 OldIndex = -1;
+    int32 OldIndex = INDEX_NONE;
     UPanelWidget* OldParent = UWidgetTree::FindWidgetParent(Widget, OldIndex);
-    if (OldParent)
+
+    UPanelWidget* NewParent = OldParent;
+    if (!NewParentName.IsEmpty())
     {
-        OldParent->RemoveChild(Widget);
+        NewParent = Cast<UPanelWidget>(WBP->WidgetTree->FindWidget(FName(*NewParentName)));
+        if (!NewParent)
+        {
+            return FMonolithActionResult::Error(
+                FString::Printf(TEXT("New parent '%s' not found or not a panel"), *NewParentName));
+        }
+    }
+    else if (!OldParent)
+    {
+        return FMonolithActionResult::Error(
+            FString::Printf(TEXT("Widget '%s' has no parent panel; pass new_parent_name"), *WidgetName));
     }
 
-    // Add to new parent
-    UPanelSlot* NewSlot = NewParent->AddChild(Widget);
+    // A widget can't become a child of itself or of one of its own descendants.
+    for (UWidget* Ancestor = NewParent; Ancestor; )
+    {
+        if (Ancestor == Widget)
+        {
+            return FMonolithActionResult::Error(FString::Printf(
+                TEXT("Cannot move '%s' into '%s': it is the widget itself or one of its descendants"),
+                *WidgetName, *NewParent->GetName()));
+        }
+        int32 IgnoredIndex = INDEX_NONE;
+        Ancestor = UWidgetTree::FindWidgetParent(Ancestor, IgnoredIndex);
+    }
+
+    const bool bSameParent = (NewParent == OldParent);
+    UPanelSlot* NewSlot = nullptr;
+    if (bSameParent)
+    {
+        // Reorder in place: the slot (and its layout properties) is kept.
+        const int32 LastIndex = NewParent->GetChildrenCount() - 1;
+        const int32 TargetIndex = (RequestedIndex == INDEX_NONE) ? LastIndex : FMath::Min(RequestedIndex, LastIndex);
+        NewParent->ShiftChild(TargetIndex, Widget);
+        NewSlot = Widget->Slot;
+    }
+    else
+    {
+        // Check before detaching, or the widget would be left without a parent.
+        if (!NewParent->CanAddMoreChildren())
+        {
+            return FMonolithActionResult::Error(FString::Printf(
+                TEXT("'%s' already holds its only allowed child"), *NewParent->GetName()));
+        }
+        if (OldParent)
+        {
+            OldParent->RemoveChild(Widget);
+        }
+        NewSlot = (RequestedIndex == INDEX_NONE)
+            ? NewParent->AddChild(Widget)
+            : NewParent->InsertChildAt(RequestedIndex, Widget);
+    }
 
     FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WBP);
 
@@ -383,8 +448,11 @@ FMonolithActionResult FMonolithUISlotActions::HandleMoveWidget(const TSharedPtr<
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("widget"), WidgetName);
     Result->SetStringField(TEXT("old_parent"), OldParent ? OldParent->GetName() : TEXT("none"));
-    Result->SetStringField(TEXT("new_parent"), NewParentName);
+    Result->SetNumberField(TEXT("old_index"), OldIndex);
+    Result->SetStringField(TEXT("new_parent"), NewParent->GetName());
+    Result->SetNumberField(TEXT("index"), NewParent->GetChildIndex(Widget));
     Result->SetStringField(TEXT("new_slot_type"), NewSlot ? NewSlot->GetClass()->GetName() : TEXT("none"));
+    Result->SetBoolField(TEXT("slot_preserved"), bSameParent);
     Result->SetBoolField(TEXT("compiled"), bCompile);
     return FMonolithActionResult::Success(Result);
 }
