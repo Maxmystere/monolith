@@ -11,6 +11,7 @@ public:
 
 	static FMonolithActionResult HandleListGraphs(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleGetGraphData(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleRenderGraph(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleGetGraphSummary(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleGetVariables(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleGetExecutionFlow(const TSharedPtr<FJsonObject>& Params);

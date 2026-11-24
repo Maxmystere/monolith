@@ -24,7 +24,8 @@ Also works on: Level Blueprints (map path or `$current`), Widget Blueprints.
 |--------|-----------|---------|
 | `list_graphs` | `asset_path` | All event/function/macro graphs |
 | `get_graph_summary` | `asset_path`, `graph_name` | Node counts by type |
-| `get_graph_data` | `asset_path`, `graph_name`, `node_class_filter`? | Full topology: pins, connections, positions |
+| `get_graph_data` | `asset_path`, `graph_name`, `node_class_filter`?, `graph_names`?, `max_nodes`?, `offset`?, `include_pin_types`? | Full topology: pins, connections, positions. `graph_names: []` = every graph; paging reports `truncated` / `next_offset` |
+| `render_graph` | `asset_path`, `graph_names`?, `include_positions`?, `max_nodes`?, `offset`? | Whole Blueprint as compact pseudo-code (exec flow, inlined pure expressions, `L1:`/`goto`, handles). Best first read of an unfamiliar Blueprint |
 | `get_variables` | `asset_path` | Variables with types, defaults, replication |
 | `get_execution_flow` | `asset_path`, `graph_name`, `entry_point` | Trace execution wires |
 | `search_nodes` | `asset_path`, `query` | Find by class/name/comment |
@@ -223,5 +224,5 @@ blueprint_query({ action: "add_node", params: {
 - Pin names are case-insensitive. Wrong names show available pins in error.
 - Compile errors include `node_id` + `graph_name` for targeted debugging.
 - Any `UK2Node_` subclass name works as `node_type` (generic fallback).
-- Use `get_graph_summary` first, then `get_graph_data` with `node_class_filter` for specifics.
+- Read an unfamiliar Blueprint with `render_graph` first (all graphs, a fraction of the JSON size), then `get_graph_data` / `get_node_details` for the nodes you will edit (node ids, pin names).
 - Always compile after structural changes.
