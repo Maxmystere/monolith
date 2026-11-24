@@ -58,12 +58,22 @@ namespace MonolithUI
      */
     struct MONOLITHUI_API FAnimationCoreKey
     {
+        /** Seconds. */
         double Time = 0.0;
         float Value = 0.0f;
         /** "cubic" / "linear" / "constant". */
         FString Interp = TEXT("cubic");
+        /**
+         * Slopes in value units per SECOND. `InsertFloatChannelKey` divides them by
+         * the tick resolution, because `FMovieSceneTangentData` stores value per tick.
+         */
         float ArriveTangent = 0.0f;
         float LeaveTangent = 0.0f;
+        /**
+         * Handle lengths, measured in (seconds, value) space: the engine's weighted
+         * cubic puts the handle tip at key + (cos a, sin a) * Weight, where
+         * tan a = the per-second slope. Stored as-is.
+         */
         float ArriveTangentWeight = 0.0f;
         float LeaveTangentWeight = 0.0f;
         bool bHasWeights = false;
@@ -72,16 +82,17 @@ namespace MonolithUI
     /**
      * CSS cubic-bezier-to-weighted-tangent conversion.
      *
-     * Given a CSS-style `cubic-bezier(x1, y1, x2, y2)` control-point pair, plus a
-     * value-delta (ToValue - FromValue) and segment duration, fill OutKey0 (segment
-     * start) and OutKey1 (segment end) with the leave/arrive tangent + tangent-weight
-     * pair UE 5.7's weighted-tangent channel API consumes.
+     * Given a CSS-style `cubic-bezier(x1, y1, x2, y2)` control-point pair, plus the
+     * segment's from/to values and start/end times, fill OutKey0 (segment start) and
+     * OutKey1 (segment end) so the engine's weighted cubic reproduces the CSS curve.
      *
-     * Math is OUR derivation from the CSS easing spec and UE's `FMovieSceneTangentData`
-     * shape: leave-tangent slope from the (x1,y1) handle, leave-weight = handle length / 3
-     * (cubic bezier's natural normalisation), and the symmetric pair from (1-x2, 1-y2)
-     * for the arrival side. See `Plugins/Monolith/Source/MonolithUI/Private/Actions/Hoisted/AnimationCoreActions.cpp`
-     * (the original action handler still calls this — Phase I lifted it from the action body).
+     * The CSS control points are the Bezier handles in normalised (time, progress)
+     * space. They are scaled into (seconds, value) space: the leave handle of key 0
+     * is (x1 * Duration, y1 * DeltaValue), the arrive handle of key 1 is
+     * ((1 - x2) * Duration, (1 - y2) * DeltaValue). Each key gets that handle's slope
+     * (value per second, see FAnimationCoreKey) and its length as the weight. A
+     * vertical handle (x1 == 0 or x2 == 1) is kept a hair off vertical so the slope
+     * stays finite.
      *
      * Both keys are returned with `Interp = "cubic"` and `bHasWeights = true`.
      */
@@ -112,18 +123,41 @@ namespace MonolithUI
         bool bIsRootWidget);
 
     /**
-     * Find or create a float track + its first section for `PropertyName` on the
-     * possessable identified by `PossessableGuid`. Returns the section's float
-     * channel ready for key insertion. Re-uses the existing section if present
-     * (keys are reset for idempotent re-build).
+     * Index of the UMovieScene2DTransformSection channel a render-transform path
+     * names, in the section's channel order (Translation.X, Translation.Y, Angle,
+     * Scale.X, Scale.Y, Shear.X, Shear.Y), or INDEX_NONE. Paths are
+     * `RenderTransform.<Field>[.X|.Y]`, matched case-insensitively.
+     */
+    MONOLITHUI_API int32 GetRenderTransformChannelIndex(const FString& PropertyPath);
+
+    /**
+     * Find or create the track + first section that animates `PropertyName` on the
+     * possessable identified by `PossessableGuid`, and return the float channel to
+     * key. Re-uses the existing section if present; when bResetExistingKeys is true
+     * the returned channel's keys are cleared, for idempotent re-builds.
+     *
+     * Render-transform paths (see GetRenderTransformChannelIndex) are keyed on the
+     * matching channel of a UMovieScene2DTransformTrack bound to `RenderTransform`.
+     * That track goes through UWidget::SetRenderTransform, which pushes the value to
+     * Slate; a float track on the nested path would only write the struct field, so
+     * the widget would not move on screen. A float track left on the same nested
+     * path by an earlier version is removed. Any other `RenderTransform*` path is an
+     * error.
+     *
+     * Every other property gets a float track. OutMessage, when given, receives the
+     * error when nullptr is returned, or a warning (otherwise empty) when a nested
+     * path is keyed on a float track, since the engine writes such paths without
+     * calling the widget's setter.
      */
     MONOLITHUI_API FMovieSceneFloatChannel* EnsureFloatTrackSectionChannel(
         UMovieScene* Scene,
         const FGuid& PossessableGuid,
         const FString& PropertyName,
-        const TRange<FFrameNumber>& SectionRange);
+        const TRange<FFrameNumber>& SectionRange,
+        bool bResetExistingKeys = true,
+        FString* OutMessage = nullptr);
 
-    /** Insert a single key into a float channel. */
+    /** Insert a single key into a float channel. Tangents follow FAnimationCoreKey's units. */
     MONOLITHUI_API void InsertFloatChannelKey(
         FMovieSceneFloatChannel* Channel,
         const FFrameRate& TickRes,

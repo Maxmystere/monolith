@@ -304,15 +304,21 @@ void FUIAnimationMovieSceneBuilder::BuildSingle(
         WidgetAnim, Scene, WidgetNameStr, bIsRoot);
 
     const TRange<FFrameNumber> SectionRange(StartFrame, EndFrame);
+    FString TrackMessage;
     FMovieSceneFloatChannel* Channel = MonolithUI::EnsureFloatTrackSectionChannel(
-        Scene, PossessableGuid, PropertyNameStr, SectionRange);
+        Scene, PossessableGuid, PropertyNameStr, SectionRange, /*bResetExistingKeys=*/true, &TrackMessage);
     if (!Channel)
     {
         OutResult.bSuccess = false;
         OutResult.ErrorMessage = FString::Printf(
-            TEXT("Failed to create float track for '%s.%s' on animation '%s'."),
-            *WidgetNameStr, *PropertyNameStr, *AnimNameStr);
+            TEXT("Failed to create track for '%s.%s' on animation '%s'%s%s"),
+            *WidgetNameStr, *PropertyNameStr, *AnimNameStr,
+            TrackMessage.IsEmpty() ? TEXT(".") : TEXT(": "), *TrackMessage);
         return;
+    }
+    if (!TrackMessage.IsEmpty())
+    {
+        OutResult.Warnings.Add(FString::Printf(TEXT("Animation '%s': %s"), *AnimNameStr, *TrackMessage));
     }
     ++OutResult.TracksCreated;
 

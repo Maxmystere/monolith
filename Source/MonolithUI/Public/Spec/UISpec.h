@@ -440,19 +440,19 @@ struct MONOLITHUI_API FUISpecKeyframe
     UPROPERTY(BlueprintReadWrite, Category = "MonolithUI|Spec")
     bool bUseCustomTangents = false;
 
-    /** Cubic arrival tangent. */
+    /** Cubic arrival tangent: slope in value per second. */
     UPROPERTY(BlueprintReadWrite, Category = "MonolithUI|Spec")
     float ArriveTangent = 0.f;
 
-    /** Cubic leave tangent. */
+    /** Cubic leave tangent: slope in value per second. */
     UPROPERTY(BlueprintReadWrite, Category = "MonolithUI|Spec")
     float LeaveTangent = 0.f;
 
-    /** Cubic arrival weight. */
+    /** Cubic arrival weight: handle length in (seconds, value) space. */
     UPROPERTY(BlueprintReadWrite, Category = "MonolithUI|Spec")
     float ArriveWeight = 0.f;
 
-    /** Cubic leave weight. */
+    /** Cubic leave weight: handle length in (seconds, value) space. */
     UPROPERTY(BlueprintReadWrite, Category = "MonolithUI|Spec")
     float LeaveWeight = 0.f;
 };
@@ -474,7 +474,11 @@ struct MONOLITHUI_API FUISpecAnimation
     UPROPERTY(BlueprintReadWrite, Category = "MonolithUI|Spec")
     FName TargetWidgetId;
 
-    /** Target property token (e.g. `RenderOpacity`, `Color`, `Translation`). */
+    /**
+     * Target property (e.g. `RenderOpacity`). Render-transform components use
+     * `RenderTransform.Translation.X|Y`, `RenderTransform.Scale.X|Y`,
+     * `RenderTransform.Shear.X|Y` or `RenderTransform.Angle`.
+     */
     UPROPERTY(BlueprintReadWrite, Category = "MonolithUI|Spec")
     FName TargetProperty;
 
