@@ -1252,14 +1252,20 @@ Registered only in a source build of a project that enables the ModelViewViewMod
 
 | Action | Params | Description |
 |---|---|---|
-| `mvvm_get_view` | `asset_path`, `widget?` | Read viewmodels, bindings (with conversion pins and messages), events, conditions and view settings. Read-only. `widget` filters bindings/events/conditions; `*_count` are filtered, `total_*_count` are not; an unknown widget name is an error listing valid names. |
+| `mvvm_get_view` | `asset_path`, `widget?` | Read viewmodels, bindings (with conversion pins and messages), events, conditions, view extensions (`view_extensions`: panel widget extensions with their entry widget class and viewmodel) and view settings. Read-only. `widget` filters bindings/events/conditions/extensions, matching pin paths too (a conversion function's source); `*_count` are filtered, `total_*_count` are not; an unknown widget name is an error listing valid names. |
 | `mvvm_add_viewmodel` | `asset_path`, `viewmodel_class`, `name?`, `creation_type?`, `global_identifier?`, `property_path?`, `compile?` (true) | Add a viewmodel (the class must implement `INotifyFieldValueChanged`). Default creation type: `CreateInstance` if the class allows it, else the first allowed type; `creation_type_source` reports which. `Resolver` is refused. |
-| `mvvm_remove_viewmodel` | `asset_path`, `name`, `remove_bindings?` (false), `compile?` (true) | Remove a viewmodel; refuses while bindings/events use it unless `remove_bindings=true`. |
+| `mvvm_remove_viewmodel` | `asset_path`, `name`, `remove_bindings?` (false), `compile?` (true) | Remove a viewmodel; refuses while bindings, events or conditions use it unless `remove_bindings=true`, which removes them too. |
 | `mvvm_add_binding` | `asset_path`, `source`, `destination`, `mode?` (`OneWayToDestination`), `execution_mode?`, `conversion_function?`, `conversion_argument?`, `compile?` (true) | Add a binding; optional forward conversion function whose argument receives the source. |
 | `mvvm_remove_binding` | `asset_path`, `binding_id?` or `binding_index?`, `compile?` (true) | Remove a binding. |
 | `mvvm_add_event` | `asset_path`, `event`, `destination`, `arguments?` (object: argument name -> path), `compile?` (true) | Widget delegate -> viewmodel/self function. Needs the MVVM project setting "Allow Binding Event". |
 | `mvvm_remove_event` | `asset_path`, `event_name?` or `event_index?`, `compile?` (true) | Remove an event. |
 | `mvvm_set_field_notify` | `asset_path` (any Blueprint), `variable`, `enabled?` (true), `compile?` (true) | Toggle FieldNotify metadata on a Blueprint member variable; the parent must implement `INotifyFieldValueChanged`. |
+| `mvvm_rename_viewmodel` | `asset_path`, `name`, `new_name`, `compile?` (true) | Rename a viewmodel; bindings, events and conditions follow. Referencing Blueprints are loaded first, so the engine's "load referencers?" prompt never blocks. |
+| `mvvm_set_event_argument` | `asset_path`, `event_name?` or `event_index?`, `argument`, `path?` or `value?`, `compile?` (true) | Set one event argument to a source path or to a literal (checked against the pin type first). |
+| `mvvm_add_condition` | `asset_path`, `condition`, `destination`, `operation`, `value?`, `max_value?`, `compile?` (true) | When the `condition` value passes `operation` (`Equal`, `MoreThan`, `BetweenInclusive`, ...), call `destination`. Needs the MVVM project setting "Allow Condition Binding". |
+| `mvvm_remove_condition` | `asset_path`, `condition_index`, `compile?` (true) | Remove a condition. |
+| `mvvm_add_panel_extension` | `asset_path`, `widget`, `entry_widget_class`, `entry_viewmodel?`, `num_designer_preview_entries?`, `compile?` (true) | Add the panel widget extension to an empty panel: one entry widget per viewmodel of a list. `entry_viewmodel` defaults to the entry widget's only viewmodel. |
+| `mvvm_remove_panel_extension` | `asset_path`, `widget`, `compile?` (true) | Remove a panel widget extension. |
 
 **GAS UI binding aliases (4 — same handlers as `gas::*` versions):**
 

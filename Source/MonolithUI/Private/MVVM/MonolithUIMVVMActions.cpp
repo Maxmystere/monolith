@@ -6,7 +6,17 @@
 #include "MonolithUIInternal.h"
 #include "MonolithParamSchema.h"
 #include "MonolithJsonUtils.h"
+#include "Reflection/MonolithReflectionReader.h"
 
+#include "AssetRegistry/ARFilter.h"
+#include "AssetRegistry/AssetData.h"
+#include "AssetRegistry/IAssetRegistry.h"
+#include "Blueprint/UserWidget.h"
+#include "Blueprint/WidgetTree.h"
+#include "Components/PanelSlot.h"
+#include "Components/PanelWidget.h"
+#include "WidgetBlueprint.h"
+#include "WidgetBlueprintExtension.h"
 #include "Editor.h"
 #include "ScopedTransaction.h"
 #include "Engine/Blueprint.h"
@@ -31,6 +41,10 @@
 #include "MVVMBlueprintPin.h"
 #include "MVVMBlueprintFunctionReference.h"
 #include "MVVMPropertyPath.h"
+#include "MVVMDeveloperProjectSettings.h"
+#include "MVVMWidgetBlueprintExtension_View.h"
+#include "Extensions/MVVMBlueprintViewExtension.h"
+#include "Extensions/MVVMViewBlueprintPanelWidgetExtension.h"
 
 // ModelViewViewModel (runtime)
 #include "Types/MVVMBindingMode.h"
@@ -804,6 +818,204 @@ namespace
         return nullptr;
     }
 
+    UMVVMBlueprintViewCondition* MvvmActionsFindCondition(UMVVMBlueprintView* View, const TSharedPtr<FJsonObject>& Params, int32& OutIndex, FString& OutError)
+    {
+        TArrayView<TObjectPtr<UMVVMBlueprintViewCondition>> Conditions = View->GetConditions();
+        double IndexValue = -1.0;
+        if (!Params->TryGetNumberField(TEXT("condition_index"), IndexValue))
+        {
+            OutError = TEXT("Pass condition_index (from ui.mvvm_get_view).");
+            return nullptr;
+        }
+        const int32 Index = static_cast<int32>(IndexValue);
+        if (Conditions.IsValidIndex(Index) && Conditions[Index])
+        {
+            OutIndex = Index;
+            return Conditions[Index];
+        }
+        OutError = FString::Printf(TEXT("condition_index %d is out of range (%d conditions)."), Index, Conditions.Num());
+        return nullptr;
+    }
+
+    // ------------------------------------------------------------------
+    // Widget filter
+    // ------------------------------------------------------------------
+
+    bool MvvmActionsPinsUseWidget(TArrayView<const FMVVMBlueprintPin> Pins, FName WidgetName)
+    {
+        for (const FMVVMBlueprintPin& Pin : Pins)
+        {
+            if (Pin.UsedPathAsValue() && Pin.GetPath().GetWidgetName() == WidgetName)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * A binding with a conversion function keeps its source in one of the function's
+     * argument pins (the binding's own SourcePath is cleared), so the pins count too.
+     */
+    bool MvvmActionsBindingUsesWidget(const FMVVMBlueprintViewBinding& Binding, FName WidgetName)
+    {
+        if (Binding.SourcePath.GetWidgetName() == WidgetName || Binding.DestinationPath.GetWidgetName() == WidgetName)
+        {
+            return true;
+        }
+        for (const bool bSourceToDestination : { true, false })
+        {
+            const UMVVMBlueprintViewConversionFunction* Conversion = Binding.Conversion.GetConversionFunction(bSourceToDestination);
+            if (Conversion && MvvmActionsPinsUseWidget(Conversion->GetPins(), WidgetName))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ------------------------------------------------------------------
+    // View extensions (panel widget extension)
+    // ------------------------------------------------------------------
+
+    UMVVMWidgetBlueprintExtension_View* MvvmActionsFindViewExtension(const UWidgetBlueprint* WBP)
+    {
+        return UWidgetBlueprintExtension::GetExtension<UMVVMWidgetBlueprintExtension_View>(WBP);
+    }
+
+    /** A reflected UPROPERTY of an extension; the panel extension's fields are private. */
+    template <typename TValue>
+    TValue* MvvmActionsExtensionField(UObject* Extension, const TCHAR* Name)
+    {
+        FProperty* Prop = Extension ? Extension->GetClass()->FindPropertyByName(Name) : nullptr;
+        return Prop ? Prop->ContainerPtrToValuePtr<TValue>(Extension) : nullptr;
+    }
+
+    UMVVMBlueprintViewExtension* MvvmActionsFindPanelExtension(const UMVVMWidgetBlueprintExtension_View* ViewExtension, FName WidgetName)
+    {
+        if (ViewExtension)
+        {
+            for (UMVVMBlueprintViewExtension* Existing : ViewExtension->GetBlueprintExtensionsForWidget(WidgetName))
+            {
+                if (Existing && Existing->IsA<UMVVMBlueprintViewExtension_PanelWidget>())
+                {
+                    return Existing;
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    const UMVVMBlueprintView* MvvmActionsEntryView(UClass* EntryClass)
+    {
+        const UWidgetBlueprint* EntryBP = EntryClass ? Cast<UWidgetBlueprint>(EntryClass->ClassGeneratedBy) : nullptr;
+        const UMVVMWidgetBlueprintExtension_View* Extension = EntryBP ? MvvmActionsFindViewExtension(EntryBP) : nullptr;
+        return Extension ? Extension->GetBlueprintView() : nullptr;
+    }
+
+    TArray<TSharedPtr<FJsonValue>> MvvmActionsViewExtensionsToJson(const UWidgetBlueprint* WBP, FName WidgetFilter)
+    {
+        TArray<TSharedPtr<FJsonValue>> Out;
+        const UMVVMWidgetBlueprintExtension_View* ViewExtension = MvvmActionsFindViewExtension(WBP);
+        if (!ViewExtension)
+        {
+            return Out;
+        }
+        for (UMVVMBlueprintViewExtension* Extension : ViewExtension->GetAllBlueprintExtensions())
+        {
+            if (!Extension)
+            {
+                continue;
+            }
+            const FName* Widget = MvvmActionsExtensionField<FName>(Extension, TEXT("WidgetName"));
+            if (!WidgetFilter.IsNone() && (!Widget || *Widget != WidgetFilter))
+            {
+                continue;
+            }
+            TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+            Obj->SetStringField(TEXT("class"), Extension->GetClass()->GetName());
+            Obj->SetStringField(TEXT("widget"), Widget ? Widget->ToString() : FString());
+            if (Extension->IsA<UMVVMBlueprintViewExtension_PanelWidget>())
+            {
+                const TSubclassOf<UUserWidget>* EntryClass = MvvmActionsExtensionField<TSubclassOf<UUserWidget>>(Extension, TEXT("EntryWidgetClass"));
+                const FGuid* EntryId = MvvmActionsExtensionField<FGuid>(Extension, TEXT("EntryViewModelId"));
+                UClass* Entry = EntryClass ? EntryClass->Get() : nullptr;
+                const UMVVMBlueprintView* EntryView = MvvmActionsEntryView(Entry);
+                const FMVVMBlueprintViewModelContext* EntryContext = (EntryView && EntryId) ? EntryView->FindViewModel(*EntryId) : nullptr;
+                const TObjectPtr<UPanelSlot>* Slot = MvvmActionsExtensionField<TObjectPtr<UPanelSlot>>(Extension, TEXT("SlotObj"));
+                Obj->SetStringField(TEXT("entry_widget_class"), Entry ? Entry->GetPathName() : FString());
+                Obj->SetStringField(TEXT("entry_viewmodel_id"), EntryId ? MvvmActionsGuidToString(*EntryId) : FString());
+                Obj->SetStringField(TEXT("entry_viewmodel"), EntryContext ? EntryContext->GetViewModelName().ToString() : FString());
+                Obj->SetStringField(TEXT("slot_class"), (Slot && *Slot) ? (*Slot)->GetClass()->GetName() : FString());
+            }
+            // Everything else the extension reflects, for extension types this file does not know.
+            TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+            for (TFieldIterator<FProperty> It(Extension->GetClass()); It; ++It)
+            {
+                if (It->GetOwnerClass() == UObject::StaticClass())
+                {
+                    continue;
+                }
+                Properties->SetField(It->GetName(), FMonolithReflectionReader::PropertyToJsonValue(*It, It->ContainerPtrToValuePtr<void>(Extension), Extension));
+            }
+            Obj->SetObjectField(TEXT("properties"), Properties);
+            Out.Add(MakeShared<FJsonValueObject>(Obj));
+        }
+        return Out;
+    }
+
+    // ------------------------------------------------------------------
+    // Rename and event arguments
+    // ------------------------------------------------------------------
+
+    /**
+     * UMVVMEditorSubsystem::RenameViewModel asks, through a modal dialog, whether to load the
+     * unloaded Blueprints that reference this one (their bindings follow the rename only when
+     * loaded). Loading them first, as answering Yes would, keeps the call from blocking on it.
+     */
+    void MvvmActionsLoadBlueprintReferencers(const UWidgetBlueprint* WBP)
+    {
+        FARFilter Filter;
+        Filter.bIncludeOnlyOnDiskAssets = true;
+        Filter.bRecursiveClasses = true;
+        Filter.ClassPaths.Add(UBlueprint::StaticClass()->GetClassPathName());
+        IAssetRegistry& AssetRegistry = IAssetRegistry::GetChecked();
+        AssetRegistry.GetReferencers(WBP->GetPackage()->GetFName(), Filter.PackageNames, UE::AssetRegistry::EDependencyCategory::Package);
+        if (Filter.PackageNames.IsEmpty())
+        {
+            return;
+        }
+        TArray<FAssetData> Referencers;
+        AssetRegistry.GetAssets(Filter, Referencers);
+        for (const FAssetData& Referencer : Referencers)
+        {
+            Referencer.GetAsset();
+        }
+    }
+
+    /** Pin id from "Name" or "Parent.Child" (a split pin). */
+    FMVVMBlueprintPinId MvvmActionsPinIdFromString(const FString& Pin)
+    {
+        TArray<FString> Parts;
+        Pin.ParseIntoArray(Parts, TEXT("."), /*bCullEmpty*/ true);
+        TArray<FName> Names;
+        for (const FString& Part : Parts)
+        {
+            Names.Add(FName(*Part.TrimStartAndEnd()));
+        }
+        return FMVVMBlueprintPinId(MoveTemp(Names));
+    }
+
+    TArray<FString> MvvmActionsPinNames(TArrayView<const FMVVMBlueprintPin> Pins)
+    {
+        TArray<FString> Names;
+        for (const FMVVMBlueprintPin& Pin : Pins)
+        {
+            Names.Add(Pin.GetId().ToString());
+        }
+        return Names;
+    }
+
     // ------------------------------------------------------------------
     // Handlers
     // ------------------------------------------------------------------
@@ -861,9 +1073,7 @@ namespace
             for (int32 Index = 0; Index < AllBindings.Num(); ++Index)
             {
                 const FMVVMBlueprintViewBinding& Binding = AllBindings[Index];
-                if (!FilterName.IsNone()
-                    && Binding.SourcePath.GetWidgetName() != FilterName
-                    && Binding.DestinationPath.GetWidgetName() != FilterName)
+                if (!FilterName.IsNone() && !MvvmActionsBindingUsesWidget(Binding, FilterName))
                 {
                     continue;
                 }
@@ -880,7 +1090,8 @@ namespace
                 }
                 if (!FilterName.IsNone()
                     && Event->GetEventPath().GetWidgetName() != FilterName
-                    && Event->GetDestinationPath().GetWidgetName() != FilterName)
+                    && Event->GetDestinationPath().GetWidgetName() != FilterName
+                    && !MvvmActionsPinsUseWidget(Event->GetPins(), FilterName))
                 {
                     continue;
                 }
@@ -895,7 +1106,10 @@ namespace
                 {
                     continue;
                 }
-                if (!FilterName.IsNone() && Condition->GetDestinationPath().GetWidgetName() != FilterName)
+                if (!FilterName.IsNone()
+                    && Condition->GetConditionPath().GetWidgetName() != FilterName
+                    && Condition->GetDestinationPath().GetWidgetName() != FilterName
+                    && !MvvmActionsPinsUseWidget(Condition->GetPins(), FilterName))
                 {
                     continue;
                 }
@@ -913,14 +1127,19 @@ namespace
             }
         }
 
+        // Extensions live on the view extension, not on the view, so they are read even without a view.
+        const TArray<TSharedPtr<FJsonValue>> Extensions = MvvmActionsViewExtensionsToJson(WBP, WidgetFilter.IsEmpty() ? NAME_None : FName(*WidgetFilter));
+
         Result->SetArrayField(TEXT("viewmodels"), ViewModels);
         Result->SetArrayField(TEXT("bindings"), Bindings);
         Result->SetArrayField(TEXT("events"), Events);
         Result->SetArrayField(TEXT("conditions"), Conditions);
+        Result->SetArrayField(TEXT("view_extensions"), Extensions);
         Result->SetNumberField(TEXT("viewmodel_count"), ViewModels.Num());
         Result->SetNumberField(TEXT("binding_count"), Bindings.Num());
         Result->SetNumberField(TEXT("event_count"), Events.Num());
         Result->SetNumberField(TEXT("condition_count"), Conditions.Num());
+        Result->SetNumberField(TEXT("view_extension_count"), Extensions.Num());
         // Totals ignore the widget filter; without a filter they equal the *_count fields.
         Result->SetNumberField(TEXT("total_binding_count"), View ? View->GetBindings().Num() : 0);
         Result->SetNumberField(TEXT("total_event_count"), View ? View->GetEvents().Num() : 0);
@@ -1178,12 +1397,20 @@ namespace
                 DependentEvents.Add(Event);
             }
         }
+        TArray<UMVVMBlueprintViewCondition*> DependentConditions;
+        for (const TObjectPtr<UMVVMBlueprintViewCondition>& Condition : View->GetConditions())
+        {
+            if (Condition && (PathUses(Condition->GetConditionPath()) || PathUses(Condition->GetDestinationPath()) || PinsUse(Condition->GetPins())))
+            {
+                DependentConditions.Add(Condition);
+            }
+        }
 
-        if ((BindingIndices.Num() > 0 || DependentEvents.Num() > 0) && !bRemoveBindings)
+        if ((BindingIndices.Num() > 0 || DependentEvents.Num() > 0 || DependentConditions.Num() > 0) && !bRemoveBindings)
         {
             return FMonolithActionResult::Error(FString::Printf(
-                TEXT("Viewmodel '%s' is used by %d binding(s) and %d event(s). Pass remove_bindings=true to remove them with the viewmodel."),
-                *Name, BindingIndices.Num(), DependentEvents.Num()));
+                TEXT("Viewmodel '%s' is used by %d binding(s), %d event(s) and %d condition(s). Pass remove_bindings=true to remove them with the viewmodel."),
+                *Name, BindingIndices.Num(), DependentEvents.Num(), DependentConditions.Num()));
         }
 
         FScopedTransaction Transaction(NSLOCTEXT("MonolithUIMVVM", "RemoveViewModel", "Monolith: Remove Viewmodel"));
@@ -1197,6 +1424,10 @@ namespace
         {
             View->RemoveEvent(Event);
         }
+        for (UMVVMBlueprintViewCondition* Condition : DependentConditions)
+        {
+            View->RemoveCondition(Condition);
+        }
         const bool bRemoved = View->RemoveViewModel(Id);
         if (!bRemoved)
         {
@@ -1209,6 +1440,7 @@ namespace
         Result->SetStringField(TEXT("removed"), Name);
         Result->SetNumberField(TEXT("removed_bindings"), BindingIndices.Num());
         Result->SetNumberField(TEXT("removed_events"), DependentEvents.Num());
+        Result->SetNumberField(TEXT("removed_conditions"), DependentConditions.Num());
         Result->SetBoolField(TEXT("compiled"), bCompile);
         return FMonolithActionResult::Success(Result);
     }
@@ -1283,6 +1515,27 @@ namespace
                 return FMonolithActionResult::Error(FString::Printf(
                     TEXT("'%s' is not a valid conversion function from %s to %s (it must be pure, return a value assignable to the destination and take an argument compatible with the source)."),
                     *ConversionFunction->GetName(), *SourceString, *DestinationString));
+            }
+            // The conversion's argument pins are the function's input parameters: check a named
+            // argument here, before the binding (and possibly the view) is created.
+            if (!ConversionArgument.IsEmpty())
+            {
+                TArray<FString> InputNames;
+                bool bFound = false;
+                for (TFieldIterator<FProperty> It(ConversionFunction); It && It->HasAnyPropertyFlags(CPF_Parm); ++It)
+                {
+                    if (It->HasAnyPropertyFlags(CPF_ReturnParm) || (It->HasAnyPropertyFlags(CPF_OutParm) && !It->HasAnyPropertyFlags(CPF_ReferenceParm)))
+                    {
+                        continue;
+                    }
+                    InputNames.Add(It->GetName());
+                    bFound |= It->GetName().Equals(ConversionArgument, ESearchCase::IgnoreCase);
+                }
+                if (!bFound)
+                {
+                    return FMonolithActionResult::Error(FString::Printf(TEXT("Conversion function '%s' has no argument '%s'. Arguments: [%s]."),
+                        *ConversionFunction->GetName(), *ConversionArgument, *FString::Join(InputNames, TEXT(", "))));
+                }
             }
         }
 
@@ -1466,6 +1719,12 @@ namespace
         if (!WBP) return Err;
         UMVVMEditorSubsystem* Subsystem = MvvmActionsGetSubsystem(Err);
         if (!Subsystem) return Err;
+        // UMVVMEditorSubsystem::AddEvent returns null when events are disabled; check first so
+        // the refusal does not leave a new, empty MVVM view behind.
+        if (!GetDefault<UMVVMDeveloperProjectSettings>()->bAllowBindingEvent)
+        {
+            return FMonolithActionResult::Error(TEXT("MVVM events are disabled. Enable 'Allow Binding Event' in Project Settings > Plugins > UMG Model View Viewmodel."));
+        }
 
         const UMVVMBlueprintView* ExistingView = Subsystem->GetView(WBP);
         FString PathError;
@@ -1682,6 +1941,440 @@ namespace
         return FMonolithActionResult::Success(Result);
     }
 
+    FString MvvmActionsBlueprintStatus(const UBlueprint* Blueprint)
+    {
+        switch (Blueprint->Status)
+        {
+        case BS_Error: return TEXT("error");
+        case BS_UpToDateWithWarnings: return TEXT("warnings");
+        case BS_UpToDate: return TEXT("up_to_date");
+        default: return TEXT("dirty");
+        }
+    }
+
+    FMonolithActionResult MvvmActionsHandleRenameViewModel(const TSharedPtr<FJsonObject>& Params)
+    {
+        FMonolithActionResult Err;
+        if (MvvmActionsRefuseDuringPIE(Err)) return Err;
+
+        const FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+        const FName Name(*Params->GetStringField(TEXT("name")));
+        const FName NewName(*Params->GetStringField(TEXT("new_name")).TrimStartAndEnd());
+        const bool bCompile = MonolithUIInternal::GetOptionalBool(Params, TEXT("compile"), true);
+
+        UWidgetBlueprint* WBP = MonolithUIInternal::LoadWidgetBlueprint(AssetPath, Err);
+        if (!WBP) return Err;
+        UMVVMEditorSubsystem* Subsystem = MvvmActionsGetSubsystem(Err);
+        if (!Subsystem) return Err;
+
+        UMVVMBlueprintView* View = Subsystem->GetView(WBP);
+        const FMVVMBlueprintViewModelContext* Ctx = View ? View->FindViewModel(Name) : nullptr;
+        if (!Ctx)
+        {
+            return FMonolithActionResult::Error(FString::Printf(TEXT("Viewmodel '%s' not found. Use ui.mvvm_get_view to list viewmodels."), *Name.ToString()));
+        }
+        if (!Ctx->CanRename())
+        {
+            return FMonolithActionResult::Error(FString::Printf(TEXT("Viewmodel '%s' is marked as not renamable."), *Name.ToString()));
+        }
+        const FGuid Id = Ctx->GetViewModelId();
+        FText RenameError;
+        if (!Subsystem->VerifyViewModelRename(WBP, Name, NewName, RenameError))
+        {
+            return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid new_name '%s': %s"), *NewName.ToString(), *RenameError.ToString()));
+        }
+        // Before the transaction, as the engine does, so what loading changes stays out of it.
+        MvvmActionsLoadBlueprintReferencers(WBP);
+
+        FScopedTransaction Transaction(NSLOCTEXT("MonolithUIMVVM", "RenameViewModel", "Monolith: Rename Viewmodel"));
+        WBP->Modify();
+        View->Modify();
+        // The subsystem rename also renames the viewmodel in the bindings of loaded Blueprints that use it.
+        if (!Subsystem->RenameViewModel(WBP, Name, NewName, RenameError))
+        {
+            Transaction.Cancel();
+            return FMonolithActionResult::Error(RenameError.IsEmpty()
+                ? FString::Printf(TEXT("Could not rename viewmodel '%s'."), *Name.ToString())
+                : RenameError.ToString());
+        }
+        MvvmActionsFinish(WBP, /*bStructural*/ true, bCompile);
+
+        TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+        Result->SetStringField(TEXT("asset_path"), WBP->GetPathName());
+        Result->SetStringField(TEXT("old_name"), Name.ToString());
+        if (const FMVVMBlueprintViewModelContext* Renamed = View->FindViewModel(Id))
+        {
+            Result->SetObjectField(TEXT("viewmodel"), MvvmActionsViewModelToJson(*Renamed));
+        }
+        Result->SetBoolField(TEXT("compiled"), bCompile);
+        return FMonolithActionResult::Success(Result);
+    }
+
+    FMonolithActionResult MvvmActionsHandleSetEventArgument(const TSharedPtr<FJsonObject>& Params)
+    {
+        FMonolithActionResult Err;
+        if (MvvmActionsRefuseDuringPIE(Err)) return Err;
+
+        const FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+        const FString ArgumentName = Params->GetStringField(TEXT("argument")).TrimStartAndEnd();
+        const FString PathString = MonolithUIInternal::GetOptionalString(Params, TEXT("path"));
+        const TSharedPtr<FJsonValue> ValueField = Params->TryGetField(TEXT("value"));
+        const bool bHasValue = ValueField.IsValid() && ValueField->Type != EJson::Null;
+        const bool bCompile = MonolithUIInternal::GetOptionalBool(Params, TEXT("compile"), true);
+        if (PathString.IsEmpty() == !bHasValue)
+        {
+            return FMonolithActionResult::Error(TEXT("Pass exactly one of path (a source path, e.g. viewmodel:VM.Score) or value (a literal typed into the argument)."));
+        }
+
+        UWidgetBlueprint* WBP = MonolithUIInternal::LoadWidgetBlueprint(AssetPath, Err);
+        if (!WBP) return Err;
+        UMVVMEditorSubsystem* Subsystem = MvvmActionsGetSubsystem(Err);
+        if (!Subsystem) return Err;
+
+        UMVVMBlueprintView* View = Subsystem->GetView(WBP);
+        if (!View)
+        {
+            return FMonolithActionResult::Error(TEXT("This Widget Blueprint has no MVVM view (no viewmodels or bindings)."));
+        }
+        FString FindError;
+        int32 EventIndex = INDEX_NONE;
+        UMVVMBlueprintViewEvent* Event = MvvmActionsFindEvent(View, Params, EventIndex, FindError);
+        if (!Event)
+        {
+            return FMonolithActionResult::Error(FindError);
+        }
+
+        const FMVVMBlueprintPinId PinId = MvvmActionsPinIdFromString(ArgumentName);
+        if (!Event->GetPins().ContainsByPredicate([&PinId](const FMVVMBlueprintPin& Pin) { return Pin.GetId() == PinId; }))
+        {
+            return FMonolithActionResult::Error(FString::Printf(TEXT("The event has no argument '%s'. Arguments: [%s]"),
+                *ArgumentName, *FString::Join(MvvmActionsPinNames(Event->GetPins()), TEXT(", "))));
+        }
+
+        FMVVMBlueprintPropertyPath Path;
+        FString Literal;
+        UEdGraphPin* GraphPin = nullptr;
+        const UEdGraphSchema_K2* Schema = GetDefault<UEdGraphSchema_K2>();
+        if (!PathString.IsEmpty())
+        {
+            FString PathError;
+            if (!MvvmActionsResolvePath(WBP, View, PathString, Path, PathError))
+            {
+                return FMonolithActionResult::Error(FString::Printf(TEXT("path: %s"), *PathError));
+            }
+        }
+        else
+        {
+            // TryGetString also converts numbers and booleans.
+            ValueField->TryGetString(Literal);
+            GraphPin = Event->GetOrCreateGraphPin(PinId);
+            if (!GraphPin)
+            {
+                return FMonolithActionResult::Error(FString::Printf(TEXT("Argument '%s' has no pin in the event's wrapper graph."), *ArgumentName));
+            }
+            // TrySetDefaultValue drops a value the pin rejects without a word: check it first.
+            FString UseValue;
+            TObjectPtr<UObject> UseObject = nullptr;
+            FText UseText;
+            Schema->GetPinDefaultValuesFromString(GraphPin->PinType, GraphPin->GetOwningNodeUnchecked(), Literal, UseValue, UseObject, UseText, /*bPreserveTextIdentity*/ false);
+            const FString Invalid = Schema->IsPinDefaultValid(GraphPin, UseValue, UseObject, UseText);
+            if (!Invalid.IsEmpty())
+            {
+                return FMonolithActionResult::Error(FString::Printf(TEXT("'%s' is not a valid value for argument '%s': %s"), *Literal, *ArgumentName, *Invalid));
+            }
+        }
+
+        FScopedTransaction Transaction(NSLOCTEXT("MonolithUIMVVM", "SetEventArgument", "Monolith: Set MVVM Event Argument"));
+        WBP->Modify();
+        View->Modify();
+        Event->SetFlags(RF_Transactional);
+        Event->Modify();
+        if (GraphPin)
+        {
+            Schema->TrySetDefaultValue(*GraphPin, Literal);
+            Event->SavePinValues();
+        }
+        else
+        {
+            Subsystem->SetEventArgumentPath(Event, PinId, Path);
+        }
+        MvvmActionsFinish(WBP, /*bStructural*/ false, bCompile);
+
+        TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+        Result->SetStringField(TEXT("asset_path"), WBP->GetPathName());
+        Result->SetObjectField(TEXT("event"), MvvmActionsEventToJson(WBP, View, Event, EventIndex));
+        Result->SetBoolField(TEXT("compiled"), bCompile);
+        return FMonolithActionResult::Success(Result);
+    }
+
+    FMonolithActionResult MvvmActionsHandleAddCondition(const TSharedPtr<FJsonObject>& Params)
+    {
+        FMonolithActionResult Err;
+        if (MvvmActionsRefuseDuringPIE(Err)) return Err;
+
+        const FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+        const FString ConditionString = Params->GetStringField(TEXT("condition"));
+        const FString DestinationString = Params->GetStringField(TEXT("destination"));
+        const FString OperationString = Params->GetStringField(TEXT("operation"));
+        const bool bCompile = MonolithUIInternal::GetOptionalBool(Params, TEXT("compile"), true);
+        double Value = 0.0;
+        const bool bHasValue = Params->TryGetNumberField(TEXT("value"), Value);
+        double MaxValue = 0.0;
+        const bool bHasMaxValue = Params->TryGetNumberField(TEXT("max_value"), MaxValue);
+
+        UWidgetBlueprint* WBP = MonolithUIInternal::LoadWidgetBlueprint(AssetPath, Err);
+        if (!WBP) return Err;
+        UMVVMEditorSubsystem* Subsystem = MvvmActionsGetSubsystem(Err);
+        if (!Subsystem) return Err;
+        // UMVVMEditorSubsystem::AddCondition returns null when conditions are disabled.
+        if (!GetDefault<UMVVMDeveloperProjectSettings>()->bAllowConditionBinding)
+        {
+            return FMonolithActionResult::Error(TEXT("MVVM conditions are disabled. Enable 'Allow Condition Binding' in Project Settings > Plugins > UMG Model View Viewmodel."));
+        }
+
+        EMVVMConditionOperation Operation = EMVVMConditionOperation::Equal;
+        if (!MvvmActionsEnumFromString(OperationString, Operation))
+        {
+            return FMonolithActionResult::Error(FString::Printf(TEXT("Unknown operation '%s'. Valid: %s"),
+                *OperationString, *FString::Join(MvvmActionsEnumNames<EMVVMConditionOperation>(), TEXT(", "))));
+        }
+
+        const UMVVMBlueprintView* ExistingView = Subsystem->GetView(WBP);
+        FString PathError;
+        FMVVMBlueprintPropertyPath ConditionPath;
+        if (!MvvmActionsResolvePath(WBP, ExistingView, ConditionString, ConditionPath, PathError))
+        {
+            return FMonolithActionResult::Error(FString::Printf(TEXT("condition: %s"), *PathError));
+        }
+        FMVVMBlueprintPropertyPath DestinationPath;
+        if (!MvvmActionsResolvePath(WBP, ExistingView, DestinationString, DestinationPath, PathError))
+        {
+            return FMonolithActionResult::Error(FString::Printf(TEXT("destination: %s"), *PathError));
+        }
+
+        FScopedTransaction Transaction(NSLOCTEXT("MonolithUIMVVM", "AddCondition", "Monolith: Add MVVM Condition"));
+        WBP->Modify();
+        UMVVMBlueprintView* View = Subsystem->RequestView(WBP);
+        if (!View)
+        {
+            Transaction.Cancel();
+            return FMonolithActionResult::Error(TEXT("Could not create the MVVM view extension on this Widget Blueprint."));
+        }
+        View->Modify();
+
+        UMVVMBlueprintViewCondition* Condition = Subsystem->AddCondition(WBP);
+        if (!Condition)
+        {
+            return FMonolithActionResult::Error(TEXT("UMVVMEditorSubsystem::AddCondition did not create a condition."));
+        }
+        Subsystem->SetConditionPath(Condition, ConditionPath, /*bRequestBindingConversion*/ false);
+        Subsystem->SetConditionDestinationPath(Condition, DestinationPath);
+        Subsystem->SetConditionOperation(Condition, Operation);
+        if (bHasValue)
+        {
+            Subsystem->SetConditionOperationValue(Condition, static_cast<float>(Value));
+        }
+        if (bHasMaxValue)
+        {
+            Subsystem->SetConditionOperationMaxValue(Condition, static_cast<float>(MaxValue));
+        }
+        MvvmActionsFinish(WBP, /*bStructural*/ false, bCompile);
+
+        TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+        Result->SetStringField(TEXT("asset_path"), WBP->GetPathName());
+        Result->SetObjectField(TEXT("condition"), MvvmActionsConditionToJson(WBP, View, Condition, View->GetConditions().IndexOfByKey(Condition)));
+        Result->SetBoolField(TEXT("compiled"), bCompile);
+        return FMonolithActionResult::Success(Result);
+    }
+
+    FMonolithActionResult MvvmActionsHandleRemoveCondition(const TSharedPtr<FJsonObject>& Params)
+    {
+        FMonolithActionResult Err;
+        if (MvvmActionsRefuseDuringPIE(Err)) return Err;
+
+        const FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+        const bool bCompile = MonolithUIInternal::GetOptionalBool(Params, TEXT("compile"), true);
+
+        UWidgetBlueprint* WBP = MonolithUIInternal::LoadWidgetBlueprint(AssetPath, Err);
+        if (!WBP) return Err;
+        UMVVMEditorSubsystem* Subsystem = MvvmActionsGetSubsystem(Err);
+        if (!Subsystem) return Err;
+
+        UMVVMBlueprintView* View = Subsystem->GetView(WBP);
+        if (!View)
+        {
+            return FMonolithActionResult::Error(TEXT("This Widget Blueprint has no MVVM view (no viewmodels or bindings)."));
+        }
+        FString FindError;
+        int32 Index = INDEX_NONE;
+        UMVVMBlueprintViewCondition* Condition = MvvmActionsFindCondition(View, Params, Index, FindError);
+        if (!Condition)
+        {
+            return FMonolithActionResult::Error(FindError);
+        }
+
+        FScopedTransaction Transaction(NSLOCTEXT("MonolithUIMVVM", "RemoveCondition", "Monolith: Remove MVVM Condition"));
+        WBP->Modify();
+        Subsystem->RemoveCondition(WBP, Condition);
+        MvvmActionsFinish(WBP, /*bStructural*/ false, bCompile);
+
+        TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+        Result->SetStringField(TEXT("asset_path"), WBP->GetPathName());
+        Result->SetNumberField(TEXT("removed_index"), Index);
+        Result->SetNumberField(TEXT("remaining_conditions"), View->GetConditions().Num());
+        Result->SetBoolField(TEXT("compiled"), bCompile);
+        return FMonolithActionResult::Success(Result);
+    }
+
+    FMonolithActionResult MvvmActionsHandleAddPanelExtension(const TSharedPtr<FJsonObject>& Params)
+    {
+        FMonolithActionResult Err;
+        if (MvvmActionsRefuseDuringPIE(Err)) return Err;
+
+        const FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+        const FName WidgetName(*Params->GetStringField(TEXT("widget")));
+        const FString EntryClassString = Params->GetStringField(TEXT("entry_widget_class"));
+        const FString EntryViewModel = MonolithUIInternal::GetOptionalString(Params, TEXT("entry_viewmodel"));
+        const bool bCompile = MonolithUIInternal::GetOptionalBool(Params, TEXT("compile"), true);
+        double PreviewEntries = -1.0;
+        const bool bHasPreviewEntries = Params->TryGetNumberField(TEXT("num_designer_preview_entries"), PreviewEntries);
+
+        UWidgetBlueprint* WBP = MonolithUIInternal::LoadWidgetBlueprint(AssetPath, Err);
+        if (!WBP) return Err;
+        UMVVMEditorSubsystem* Subsystem = MvvmActionsGetSubsystem(Err);
+        if (!Subsystem) return Err;
+
+        UPanelWidget* Panel = WBP->WidgetTree ? Cast<UPanelWidget>(WBP->WidgetTree->FindWidget(WidgetName)) : nullptr;
+        if (!Panel)
+        {
+            return FMonolithActionResult::Error(FString::Printf(TEXT("'%s' is not a panel widget in this Widget Blueprint. Use ui.get_widget_tree to list widgets."), *WidgetName.ToString()));
+        }
+        // The extension owns every slot of the panel at runtime and replaces its children; the
+        // editor deletes them when it adds the extension. Refuse rather than delete them here.
+        if (Panel->GetChildrenCount() > 0)
+        {
+            return FMonolithActionResult::Error(FString::Printf(TEXT("'%s' has %d children, which the extension would replace at runtime. Remove them first."),
+                *WidgetName.ToString(), Panel->GetChildrenCount()));
+        }
+        UClass* EntryClass = MvvmActionsLoadClass(EntryClassString);
+        if (!EntryClass || !EntryClass->IsChildOf(UUserWidget::StaticClass()))
+        {
+            return FMonolithActionResult::Error(FString::Printf(TEXT("entry_widget_class '%s' is not a UserWidget class (a Widget Blueprint asset path works)."), *EntryClassString));
+        }
+        // The engine needs an entry viewmodel: without one the Widget Blueprint fails to compile.
+        const UMVVMBlueprintView* EntryView = MvvmActionsEntryView(EntryClass);
+        TArray<FString> EntryViewModelNames;
+        const FMVVMBlueprintViewModelContext* EntryContext = nullptr;
+        if (EntryView)
+        {
+            for (const FMVVMBlueprintViewModelContext& Each : EntryView->GetViewModels())
+            {
+                EntryViewModelNames.Add(Each.GetViewModelName().ToString());
+            }
+            EntryContext = !EntryViewModel.IsEmpty() ? EntryView->FindViewModel(FName(*EntryViewModel))
+                : (EntryView->GetViewModels().Num() == 1 ? &EntryView->GetViewModels()[0] : nullptr);
+        }
+        if (!EntryContext)
+        {
+            return FMonolithActionResult::Error(EntryViewModel.IsEmpty()
+                ? FString::Printf(TEXT("Pass entry_viewmodel: the entry widget has %d viewmodels [%s]."), EntryViewModelNames.Num(), *FString::Join(EntryViewModelNames, TEXT(", ")))
+                : FString::Printf(TEXT("The entry widget has no viewmodel named '%s'. Viewmodels: [%s]."), *EntryViewModel, *FString::Join(EntryViewModelNames, TEXT(", "))));
+        }
+        const FGuid EntryViewModelId = EntryContext->GetViewModelId();
+        if (MvvmActionsFindPanelExtension(MvvmActionsFindViewExtension(WBP), WidgetName))
+        {
+            return FMonolithActionResult::Error(FString::Printf(TEXT("'%s' already has a panel extension."), *WidgetName.ToString()));
+        }
+
+        FScopedTransaction Transaction(NSLOCTEXT("MonolithUIMVVM", "AddPanelExtension", "Monolith: Add MVVM Panel Extension"));
+        WBP->Modify();
+        if (UMVVMBlueprintView* View = Subsystem->RequestView(WBP))
+        {
+            View->Modify();
+        }
+        // Same setup as the engine's panel extension customization: the extension and its widget
+        // name, a slot template of the panel's slot class, then the entry class and viewmodel.
+        UMVVMWidgetBlueprintExtension_View* ViewExtension = UWidgetBlueprintExtension::RequestExtension<UMVVMWidgetBlueprintExtension_View>(WBP);
+        ViewExtension->Modify();
+        UMVVMBlueprintViewExtension* Extension = ViewExtension->CreateBlueprintWidgetExtension(UMVVMBlueprintViewExtension_PanelWidget::StaticClass(), WidgetName);
+        if (!Extension)
+        {
+            Transaction.Cancel();
+            return FMonolithActionResult::Error(TEXT("CreateBlueprintWidgetExtension did not create the panel extension."));
+        }
+        Extension->Modify();
+        if (FName* Name = MvvmActionsExtensionField<FName>(Extension, TEXT("WidgetName")))
+        {
+            *Name = WidgetName;
+        }
+        if (TObjectPtr<UPanelSlot>* Slot = MvvmActionsExtensionField<TObjectPtr<UPanelSlot>>(Extension, TEXT("SlotObj")))
+        {
+            *Slot = NewObject<UPanelSlot>(Extension, Panel->GetSlotClass(), NAME_None, RF_Transactional);
+        }
+        if (TSubclassOf<UUserWidget>* Entry = MvvmActionsExtensionField<TSubclassOf<UUserWidget>>(Extension, TEXT("EntryWidgetClass")))
+        {
+            *Entry = EntryClass;
+        }
+        if (FGuid* Id = MvvmActionsExtensionField<FGuid>(Extension, TEXT("EntryViewModelId")))
+        {
+            *Id = EntryViewModelId;
+        }
+        if (bHasPreviewEntries)
+        {
+            if (int32* Count = MvvmActionsExtensionField<int32>(Extension, TEXT("NumDesignerPreviewEntries")))
+            {
+                *Count = FMath::Clamp(static_cast<int32>(PreviewEntries), 0, 20);
+            }
+        }
+        MvvmActionsFinish(WBP, /*bStructural*/ true, bCompile);
+
+        TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+        Result->SetStringField(TEXT("asset_path"), WBP->GetPathName());
+        const TArray<TSharedPtr<FJsonValue>> Extensions = MvvmActionsViewExtensionsToJson(WBP, WidgetName);
+        if (Extensions.Num() > 0)
+        {
+            Result->SetObjectField(TEXT("view_extension"), Extensions[0]->AsObject());
+        }
+        Result->SetBoolField(TEXT("compiled"), bCompile);
+        if (bCompile)
+        {
+            Result->SetStringField(TEXT("blueprint_status"), MvvmActionsBlueprintStatus(WBP));
+        }
+        return FMonolithActionResult::Success(Result);
+    }
+
+    FMonolithActionResult MvvmActionsHandleRemovePanelExtension(const TSharedPtr<FJsonObject>& Params)
+    {
+        FMonolithActionResult Err;
+        if (MvvmActionsRefuseDuringPIE(Err)) return Err;
+
+        const FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+        const FName WidgetName(*Params->GetStringField(TEXT("widget")));
+        const bool bCompile = MonolithUIInternal::GetOptionalBool(Params, TEXT("compile"), true);
+
+        UWidgetBlueprint* WBP = MonolithUIInternal::LoadWidgetBlueprint(AssetPath, Err);
+        if (!WBP) return Err;
+
+        UMVVMWidgetBlueprintExtension_View* ViewExtension = MvvmActionsFindViewExtension(WBP);
+        UMVVMBlueprintViewExtension* Found = MvvmActionsFindPanelExtension(ViewExtension, WidgetName);
+        if (!Found)
+        {
+            return FMonolithActionResult::Error(FString::Printf(TEXT("'%s' has no panel extension. Use ui.mvvm_get_view to list view extensions."), *WidgetName.ToString()));
+        }
+
+        FScopedTransaction Transaction(NSLOCTEXT("MonolithUIMVVM", "RemovePanelExtension", "Monolith: Remove MVVM Panel Extension"));
+        WBP->Modify();
+        ViewExtension->Modify();
+        ViewExtension->RemoveBlueprintWidgetExtension(Found, WidgetName);
+        MvvmActionsFinish(WBP, /*bStructural*/ true, bCompile);
+
+        TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+        Result->SetStringField(TEXT("asset_path"), WBP->GetPathName());
+        Result->SetStringField(TEXT("removed"), WidgetName.ToString());
+        Result->SetBoolField(TEXT("compiled"), bCompile);
+        return FMonolithActionResult::Success(Result);
+    }
+
     const TCHAR* MvvmActionsPathHelp()
     {
         return TEXT("Path grammar: 'viewmodel:<ViewmodelName>.<Field>[.<Field>...]', 'widget:<WidgetName>.<Property>' or 'self:<Field>'. "
@@ -1699,13 +2392,15 @@ namespace MonolithUI
             TEXT("ui"), TEXT("mvvm_get_view"),
             TEXT("Read the UMG MVVM view of a Widget Blueprint: viewmodels (class, creation type, flags), bindings (id, mode, source/destination paths, ")
             TEXT("conversion functions with their argument pins, enabled/compile flags, compiler messages), events (widget delegate -> function, ")
-            TEXT("argument pins), conditions and view settings. Read-only. Paths are returned in the grammar the mvvm_ write actions accept."),
+            TEXT("argument pins), conditions, view extensions (panel widget extensions: entry widget class and viewmodel) and view settings. ")
+            TEXT("Read-only. Paths are returned in the grammar the mvvm_ write actions accept."),
             FMonolithActionHandler::CreateStatic(&MvvmActionsHandleGetView),
             FParamSchemaBuilder()
                 .RequiredAssetPath(TEXT("asset_path"), TEXT("Widget Blueprint asset path"))
-                .Optional(TEXT("widget"), TEXT("string"), TEXT("Only return bindings/events/conditions whose source or destination is this widget name. *_count fields are filtered; total_*_count fields are not. Unknown names return an error listing valid widget names"))
+                .Optional(TEXT("widget"), TEXT("string"), TEXT("Only return bindings/events/conditions/view extensions that use this widget name (in a path or in a conversion/argument pin). *_count fields are filtered; total_*_count fields are not. Unknown names return an error listing valid widget names"))
                 .Build(),
             Category);
+        Registry.SetActionAnnotations(TEXT("ui"), TEXT("mvvm_get_view"), /*bReadOnly*/ true, /*bDestructive*/ false, /*bIdempotent*/ true, FString());
 
         Registry.RegisterAction(
             TEXT("ui"), TEXT("mvvm_add_viewmodel"),
@@ -1726,12 +2421,12 @@ namespace MonolithUI
 
         Registry.RegisterAction(
             TEXT("ui"), TEXT("mvvm_remove_viewmodel"),
-            TEXT("Remove a viewmodel from a Widget Blueprint. Refuses when bindings or events still use it unless remove_bindings=true."),
+            TEXT("Remove a viewmodel from a Widget Blueprint. Refuses when bindings, events or conditions still use it unless remove_bindings=true."),
             FMonolithActionHandler::CreateStatic(&MvvmActionsHandleRemoveViewModel),
             FParamSchemaBuilder()
                 .RequiredAssetPath(TEXT("asset_path"), TEXT("Widget Blueprint asset path"))
                 .Required(TEXT("name"), TEXT("string"), TEXT("Viewmodel name (see mvvm_get_view)"))
-                .Optional(TEXT("remove_bindings"), TEXT("boolean"), TEXT("Also remove bindings and events that reference the viewmodel"), TEXT("false"))
+                .Optional(TEXT("remove_bindings"), TEXT("boolean"), TEXT("Also remove bindings, events and conditions that reference the viewmodel"), TEXT("false"))
                 .Optional(TEXT("compile"), TEXT("boolean"), TEXT("Compile the Widget Blueprint afterwards"), TEXT("true"))
                 .Build(),
             Category);
@@ -1802,6 +2497,88 @@ namespace MonolithUI
                 .Required(TEXT("variable"), TEXT("string"), TEXT("Member variable name"))
                 .Optional(TEXT("enabled"), TEXT("boolean"), TEXT("true to make the variable FieldNotify, false to clear it"), TEXT("true"))
                 .Optional(TEXT("compile"), TEXT("boolean"), TEXT("Compile the Blueprint afterwards"), TEXT("true"))
+                .Build(),
+            Category);
+
+        Registry.RegisterAction(
+            TEXT("ui"), TEXT("mvvm_rename_viewmodel"),
+            TEXT("Rename a viewmodel through UMVVMEditorSubsystem; bindings, events and conditions follow, including those of loaded Blueprints ")
+            TEXT("that use it. Blueprints that reference this Widget Blueprint are loaded first, so the engine's 'load referencers?' prompt never blocks the call."),
+            FMonolithActionHandler::CreateStatic(&MvvmActionsHandleRenameViewModel),
+            FParamSchemaBuilder()
+                .RequiredAssetPath(TEXT("asset_path"), TEXT("Widget Blueprint asset path"))
+                .Required(TEXT("name"), TEXT("string"), TEXT("Current viewmodel name (see mvvm_get_view)"))
+                .Required(TEXT("new_name"), TEXT("string"), TEXT("New viewmodel name"))
+                .Optional(TEXT("compile"), TEXT("boolean"), TEXT("Compile the Widget Blueprint afterwards"), TEXT("true"))
+                .Build(),
+            Category);
+
+        Registry.RegisterAction(
+            TEXT("ui"), TEXT("mvvm_set_event_argument"),
+            FString(TEXT("Set one argument of an MVVM event: either a source path (path) or a literal value typed into the argument (value), ")
+                    TEXT("checked against the argument's pin type before anything changes. ")) + MvvmActionsPathHelp(),
+            FMonolithActionHandler::CreateStatic(&MvvmActionsHandleSetEventArgument),
+            FParamSchemaBuilder()
+                .RequiredAssetPath(TEXT("asset_path"), TEXT("Widget Blueprint asset path"))
+                .Optional(TEXT("event_name"), TEXT("string"), TEXT("Event object name from mvvm_get_view"))
+                .Optional(TEXT("event_index"), TEXT("integer"), TEXT("Event index from mvvm_get_view (used when event_name is absent)"))
+                .Required(TEXT("argument"), TEXT("string"), TEXT("Argument name as listed in the event's pins ('Parent.Child' for a split pin)"))
+                .Optional(TEXT("path"), TEXT("string"), TEXT("Source path for the argument, e.g. viewmodel:VM_Player.Score or widget:Slider_0.Value"))
+                .Optional(TEXT("value"), TEXT("any"), TEXT("Literal value for the argument (string, number or boolean), in the pin's default-value format"))
+                .Optional(TEXT("compile"), TEXT("boolean"), TEXT("Compile the Widget Blueprint afterwards"), TEXT("true"))
+                .Build(),
+            Category);
+
+        Registry.RegisterAction(
+            TEXT("ui"), TEXT("mvvm_add_condition"),
+            FString(TEXT("Add an MVVM condition: when the condition path's value passes the operation against value (and max_value for ranges), ")
+                    TEXT("call the destination function. Requires 'Allow Condition Binding' in the MVVM project settings. ")) + MvvmActionsPathHelp(),
+            FMonolithActionHandler::CreateStatic(&MvvmActionsHandleAddCondition),
+            FParamSchemaBuilder()
+                .RequiredAssetPath(TEXT("asset_path"), TEXT("Widget Blueprint asset path"))
+                .Required(TEXT("condition"), TEXT("string"), TEXT("Value to test, e.g. viewmodel:VM_Player.Health"))
+                .Required(TEXT("destination"), TEXT("string"), TEXT("Function to call, e.g. self:PlayLowHealthAnimation"))
+                .Required(TEXT("operation"), TEXT("string"), TEXT("EMVVMConditionOperation name, e.g. Equal, NotEqual, MoreThan, MoreThanOrEqual, LessThan, LessThanOrEqual, BetweenInclusive, BetweenExclusive"))
+                .Optional(TEXT("value"), TEXT("number"), TEXT("Operation value"))
+                .Optional(TEXT("max_value"), TEXT("number"), TEXT("Upper bound for the Between operations"))
+                .Optional(TEXT("compile"), TEXT("boolean"), TEXT("Compile the Widget Blueprint afterwards"), TEXT("true"))
+                .Build(),
+            Category);
+
+        Registry.RegisterAction(
+            TEXT("ui"), TEXT("mvvm_remove_condition"),
+            TEXT("Remove an MVVM condition by index (from mvvm_get_view)."),
+            FMonolithActionHandler::CreateStatic(&MvvmActionsHandleRemoveCondition),
+            FParamSchemaBuilder()
+                .RequiredAssetPath(TEXT("asset_path"), TEXT("Widget Blueprint asset path"))
+                .Required(TEXT("condition_index"), TEXT("integer"), TEXT("Condition index from mvvm_get_view"))
+                .Optional(TEXT("compile"), TEXT("boolean"), TEXT("Compile the Widget Blueprint afterwards"), TEXT("true"))
+                .Build(),
+            Category);
+
+        Registry.RegisterAction(
+            TEXT("ui"), TEXT("mvvm_add_panel_extension"),
+            TEXT("Add the MVVM panel widget extension to an empty panel (VerticalBox, WrapBox, ...): at runtime the panel creates one entry widget per ")
+            TEXT("viewmodel of a list, as the Viewmodels panel's 'Panel Widget' extension does. The entry widget must have the viewmodel the entries receive."),
+            FMonolithActionHandler::CreateStatic(&MvvmActionsHandleAddPanelExtension),
+            FParamSchemaBuilder()
+                .RequiredAssetPath(TEXT("asset_path"), TEXT("Widget Blueprint asset path"))
+                .Required(TEXT("widget"), TEXT("string"), TEXT("Panel widget name; it must have no children"))
+                .Required(TEXT("entry_widget_class"), TEXT("string"), TEXT("Entry Widget Blueprint asset path or UserWidget class path"))
+                .Optional(TEXT("entry_viewmodel"), TEXT("string"), TEXT("Entry widget viewmodel the entries receive (default: the entry widget's only viewmodel)"))
+                .Optional(TEXT("num_designer_preview_entries"), TEXT("integer"), TEXT("Entries shown in the designer preview (0-20)"))
+                .Optional(TEXT("compile"), TEXT("boolean"), TEXT("Compile the Widget Blueprint afterwards (reports blueprint_status)"), TEXT("true"))
+                .Build(),
+            Category);
+
+        Registry.RegisterAction(
+            TEXT("ui"), TEXT("mvvm_remove_panel_extension"),
+            TEXT("Remove the MVVM panel widget extension from a panel."),
+            FMonolithActionHandler::CreateStatic(&MvvmActionsHandleRemovePanelExtension),
+            FParamSchemaBuilder()
+                .RequiredAssetPath(TEXT("asset_path"), TEXT("Widget Blueprint asset path"))
+                .Required(TEXT("widget"), TEXT("string"), TEXT("Panel widget name"))
+                .Optional(TEXT("compile"), TEXT("boolean"), TEXT("Compile the Widget Blueprint afterwards"), TEXT("true"))
                 .Build(),
             Category);
     }

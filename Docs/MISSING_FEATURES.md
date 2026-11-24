@@ -10,10 +10,8 @@
 
 Scoped out while landing the MVVM, skeleton / physics / Control Rig, node-measurement, component-swap and property-path work. None block what shipped.
 
-1. **MVVM authoring gaps (#173).** `mvvm_get_view` reads conditions, but there is no write path yet.
-   - **Add:** `mvvm_add_condition` / `mvvm_remove_condition` (WISHLIST) over the subsystem's `AddCondition` + `SetConditionPath` / `SetConditionDestinationPath` / `SetConditionOperation*` (present in 5.7 and 5.8).
-   - **Add:** panel-widget view extensions (`UMVVMBlueprintViewExtension_PanelWidget`; private fields need reflection) (WISHLIST).
-   - **Add:** viewmodel rename / reparent after creation, backward (destination-to-source) conversion functions, split pins, and default values for conversion / event arguments (only paths can be assigned today) (WISHLIST).
+1. **MVVM authoring gaps (#173).** Conditions, panel extensions, viewmodel rename and literal event arguments now have actions (`mvvm_add/remove_condition`, `mvvm_add/remove_panel_extension`, `mvvm_rename_viewmodel`, `mvvm_set_event_argument`).
+   - **Add:** viewmodel reparent after creation, backward (destination-to-source) conversion functions, split pins, and default values for conversion function arguments (only paths can be assigned there) (WISHLIST).
 2. **No `remove_control_rig_variable`.** `add_control_rig_variable` shipped; the interface has `RemoveMemberVariable`, so the remove side is a small follow-up (WISHLIST).
 3. **Skeleton renames.** No rename for slots, skeleton curves or blend profiles, and `remove_skeleton_slot` does not scan for references before removing (WISHLIST).
 4. **Physics asset edits are remove-then-add.** `add_physics_body` refuses an existing body instead of replacing it in place (engine `RecreateBody`), and `remove_physics_constraint` leaves pair collision disabled; call `set_body_collision` explicitly.
