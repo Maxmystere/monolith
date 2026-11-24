@@ -207,6 +207,14 @@ FMonolithActionResult FProjectSearchAction::Execute(const TSharedPtr<FJsonObject
 		Entry->SetStringField(TEXT("module_name"), SR.ModuleName);
 		Entry->SetStringField(TEXT("match_context"), SR.MatchContext);
 		Entry->SetNumberField(TEXT("rank"), SR.Rank);
+		if (!SR.PinName.IsEmpty())
+		{
+			// A literal typed into a Blueprint pin: say where it is.
+			Entry->SetStringField(TEXT("match_kind"), TEXT("pin_default"));
+			Entry->SetStringField(TEXT("graph"), SR.GraphName);
+			Entry->SetStringField(TEXT("node"), SR.NodeName);
+			Entry->SetStringField(TEXT("pin"), SR.PinName);
+		}
 		ResultsArr.Add(MakeShared<FJsonValueObject>(Entry));
 	}
 

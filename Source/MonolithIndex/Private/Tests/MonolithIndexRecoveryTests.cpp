@@ -150,7 +150,8 @@ bool FMonolithIndexRecoveryLifecycleTest::RunTest(const FString& /*Parameters*/)
 	}
 	ON_SCOPE_EXIT { Fixture.Destroy(); };
 
-	TestEqual(TEXT("a fresh database is schema v3"), Fixture.Database.ReadMeta(TEXT("schema_version")), FString(TEXT("3")));
+	TestEqual(TEXT("a fresh database is at the current schema version"), Fixture.Database.ReadMeta(TEXT("schema_version")),
+		FString::FromInt(FMonolithIndexDatabase::CurrentSchemaVersion));
 	TestTrue(TEXT("a fresh database supports resume"), Fixture.Database.SupportsIndexResume());
 	TestFalse(TEXT("no index is in progress on a fresh database"), Fixture.Database.IsFullIndexInProgress());
 
@@ -178,7 +179,7 @@ bool FMonolithIndexRecoveryLifecycleTest::RunTest(const FString& /*Parameters*/)
 	TestTrue(TEXT("ResetDatabase succeeds"), Fixture.Database.ResetDatabase());
 	TestFalse(TEXT("a reset clears the in-progress marker"), Fixture.Database.IsFullIndexInProgress());
 	TestEqual(TEXT("a reset restates the schema version"),
-		Fixture.Database.ReadMeta(TEXT("schema_version")), FString(TEXT("3")));
+		Fixture.Database.ReadMeta(TEXT("schema_version")), FString::FromInt(FMonolithIndexDatabase::CurrentSchemaVersion));
 
 	return true;
 }
@@ -298,8 +299,8 @@ bool FMonolithIndexRecoverySchemaMigrationTest::RunTest(const FString& /*Paramet
 
 	TestTrue(TEXT("deep_indexed_hash is added"), HasAssetColumn(Fixture.Database, TEXT("deep_indexed_hash")));
 	TestTrue(TEXT("deep_index_attempts is added"), HasAssetColumn(Fixture.Database, TEXT("deep_index_attempts")));
-	TestEqual(TEXT("the schema version is stamped 3"),
-		Fixture.Database.ReadMeta(TEXT("schema_version")), FString(TEXT("3")));
+	TestEqual(TEXT("the schema version is stamped current (v2 -> v3 -> v4)"),
+		Fixture.Database.ReadMeta(TEXT("schema_version")), FString::FromInt(FMonolithIndexDatabase::CurrentSchemaVersion));
 	TestTrue(TEXT("resume is available after migration"), Fixture.Database.SupportsIndexResume());
 
 	// The assertion that matters: the migration must not cost the user the index
@@ -312,7 +313,10 @@ bool FMonolithIndexRecoverySchemaMigrationTest::RunTest(const FString& /*Paramet
 	TestEqual(TEXT("its id is unchanged"), Reloaded->Id, AssetId);
 	TestEqual(TEXT("its class is intact"), Reloaded->AssetClass, FString(TEXT("Blueprint")));
 	TestEqual(TEXT("its saved hash is intact"), Reloaded->SavedHash, FString(ContentHash));
-	TestEqual(TEXT("its new checkpoint column defaults to empty"), Reloaded->DeepIndexedHash, FString());
+	// The v3 -> v4 step that follows marks a Blueprint's checkpoint stale on purpose, so
+	// the batched stale re-index fills pin_defaults; the row itself survives.
+	TestEqual(TEXT("its new checkpoint column is marked stale for the v4 Blueprint re-index"),
+		Reloaded->DeepIndexedHash, FString(MonolithStaleDeepIndexMarker));
 	TestEqual(TEXT("its new attempt column defaults to zero"), Reloaded->DeepIndexAttempts, 0);
 	TestEqual(TEXT("its child rows survive"), CountRows(Fixture.Database, TEXT("nodes")), (int64)1);
 

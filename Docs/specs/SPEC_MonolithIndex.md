@@ -15,7 +15,7 @@
 | Class | Responsibility |
 |-------|---------------|
 | `FMonolithIndexModule` | Registers 12 project actions (7 baseline + 1 v0.17.0 cross-module `audit_orphan_assets` + 3 test/profiling harness Wave 1 + 1 (2026-06-10) `export_asset_text`, Gap 11) |
-| `FMonolithIndexDatabase` | RAII SQLite wrapper. 13 tables + 2 FTS5 + 6 triggers + 1 meta. DELETE journal mode, 64MB cache. Schema v2: `saved_hash` column (Blake3 `FIoHash` hex), `schema_version` meta key. Schema v3: `deep_indexed_hash` + `deep_index_attempts` columns on `assets` (full-index resume — see **Full-Index Resume**) |
+| `FMonolithIndexDatabase` | RAII SQLite wrapper. 14 tables + 3 FTS5 + 9 triggers + 1 meta (schema v4 added `pin_defaults` + `fts_pin_defaults`). DELETE journal mode, 64MB cache. Schema v2: `saved_hash` column (Blake3 `FIoHash` hex), `schema_version` meta key. Schema v3: `deep_indexed_hash` + `deep_index_attempts` columns on `assets` (full-index resume — see **Full-Index Resume**) |
 | `UMonolithIndexSubsystem` | UEditorSubsystem. 3-layer indexing (startup delta, live AR callbacks, full fallback). Hash-based startup catch-up. Live batched AR delegates on 2s timer. Deep asset indexing with game-thread batching. Batches every 100 assets. Progress notifications |
 | `IMonolithIndexer` | Pure virtual interface: GetSupportedClasses(), IndexAsset(), GetName(), IsSentinel(), SupportsIncrementalIndex(), IndexScoped() |
 | `FBlueprintIndexer` | Blueprint, WidgetBlueprint, AnimBlueprint — graphs, nodes, variables |
@@ -45,7 +45,7 @@
 
 | Action | Params | Description |
 |--------|--------|-------------|
-| `search` | `query` (required, max 4096 chars), `limit` (50, clamped 1-1000), `asset_class` (string or array, optional) | FTS5 full-text search over the `fts_assets` and `fts_nodes` columns. **Not** variables or parameters — those are structured rows, reachable via `get_asset_details`. See **Search Error Contract** and **`asset_class` filter** below |
+| `search` | `query` (required, max 4096 chars), `limit` (50, clamped 1-1000), `asset_class` (string or array, optional) | FTS5 full-text search over the `fts_assets`, `fts_nodes` and `fts_pin_defaults` columns (a pin-default hit adds `match_kind: "pin_default"`, `graph`, `node`, `pin`). **Not** variables or parameters — those are structured rows, reachable via `get_asset_details`. See **Search Error Contract** and **`asset_class` filter** below |
 | `find_references` | `asset_path` (required) | Bidirectional dependency lookup |
 | `find_by_type` | `asset_type` (required), `limit` (100), `offset` (0) | Filter assets by class with pagination |
 | `get_stats` | none | Row counts for all 13 tables + asset class breakdown (top 20) + `skipped_assets` / `skipped_asset_paths` (assets the poison-pill rule dropped from deep indexing — see **Full-Index Resume**) + conditional `level_index_state` while level indexing is interrupted, partial, failed, or degraded |
@@ -65,11 +65,12 @@
 
 ### Database Schema
 
-**13 Tables:** assets, nodes, connections, variables, parameters, dependencies, actors, tags, tag_references, configs, cpp_symbols, datatable_rows, meta
+**14 Tables:** assets, nodes, connections, pin_defaults, variables, parameters, dependencies, actors, tags, tag_references, configs, cpp_symbols, datatable_rows, meta
 
-**2 FTS5 Virtual Tables:**
+**3 FTS5 Virtual Tables:**
 - `fts_assets` — content=assets, tokenize='porter unicode61', columns: asset_name, asset_class, description, package_path, module_name
 - `fts_nodes` — content=nodes, tokenize='porter unicode61', columns: node_name, node_class, node_type
+- `fts_pin_defaults` — content=pin_defaults, tokenize='porter unicode61', columns: value, pin_name (schema v4)
 
 **DB Location:** `Plugins/Monolith/Saved/ProjectIndex.db` when the plugin sits inside the project; `<Project>/Saved/Monolith/ProjectIndex.db` when the plugin is mounted from outside the project (engine plugin, or a shared `AdditionalPluginDirectories` folder). `DatabasePathOverride` (relative = from the project directory) overrides both.
 
@@ -115,13 +116,15 @@ end-of-results, so every failure surfaced as a successful empty result set.
 
 #### Per-table applicability — deliberate, not incidental
 
-`search` runs the same query against **two** FTS tables that carry **different**
-columns, so a column filter valid for one is `no such column` for the other. The
+`search` runs the same query against **three** FTS tables that carry **different**
+columns (`fts_assets`, `fts_nodes`, and since schema v4 `fts_pin_defaults`, skipped when
+the database lacks it), so a column filter valid for one is `no such column` for the others.
+A pin-default hit carries `match_kind: "pin_default"`, `graph`, `node` and `pin`. The
 rule:
 
 1. A table reporting `no such column:` is treated as **not applicable** to this
    query and **skipped**. Its verdict alone is not a failure.
-2. The status is `InvalidQuery` **only when both tables reject the query** that way.
+2. The status is `InvalidQuery` **only when every table rejects the query** that way.
 3. Any other step failure is classified immediately by the table that hit it —
    applicability is a special case for unknown columns, not a general "keep going".
 
@@ -205,6 +208,10 @@ Schema v2 adds:
 - Index on `saved_hash` for fast lookup
 
 Migration is automatic: on startup, `PRAGMA table_info(assets)` checks for the `saved_hash` column. If missing, `ALTER TABLE assets ADD COLUMN saved_hash TEXT` runs followed by index creation.
+
+**Schema v4 Migration (pin defaults)**
+
+Schema v4 adds `pin_defaults` (`node_id` -> `nodes.id ON DELETE CASCADE`, `graph_name`, `pin_name`, `value`) with `fts_pin_defaults` and its three sync triggers. The Blueprint indexer writes one row per input pin that is not linked, not hidden, not exec and whose default differs from the autogenerated one (`UEdGraphPin::DoesDefaultValueMatchAutogenerated`); the value is the `DefaultObject` path, else `DefaultTextValue`, else `DefaultValue`, capped at 1024 characters. The tables are created by `CreateTables` (`IF NOT EXISTS`), so fresh and existing databases both get them; the v3 -> v4 step only sets `deep_indexed_hash` to the stale marker `pre-v4` (`MonolithStaleDeepIndexMarker`) on `Blueprint` / `WidgetBlueprint` / `AnimBlueprint` assets below the poison-pill attempt limit. `saved_hash` is left alone: clearing it would hand every Blueprint to the incremental pass, which loads its whole delta in one game-thread call. The marker is not `''` because an empty checkpoint means "no child rows". **Stale re-index:** after the startup incremental pass, `StartStaleReindex()` reads the marked rows (`GetAssetsWithStaleDeepIndex()`) and runs them through the full index's batched deep pass on the indexing worker (memory throttle, periodic GC, attempt counters, cancellable notification), with no registry scan, no metadata pass, no post-pass indexers and no completion marker. Each asset's old child rows are deleted in the transaction that writes its new ones and stamps the real hash, so an interrupted run continues on the next launch. A row that reaches the attempt limit, or has no indexer or registry entry, is stamped and leaves the set; poison rows are added to `skipped_assets`. `bDeferFirstTimeIndex` defers the run. A resumed full index re-queues marked rows through its normal queue filter. It runs only from v3; a failed v3 migration leaves pin defaults unindexed until a full reindex. `HasPinDefaults()` gates both the indexer write and the search pass. `FMonolithIndexDatabase::CurrentSchemaVersion` is 4. **Downgrade:** an older build reads `"4"`, runs no migration and never touches the new tables.
 
 **Schema v3 Migration**
 
